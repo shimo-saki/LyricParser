@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "LyricParser"
+version = "0.1.0"
+description = "用于解析和序列化 Lyric 格式的 Python 库"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+    { name = "shimo-saki", email = "ameyuri@outlook.in" },
+]
+
+[project.urls]
+Homepage = "https://github.com/shimo-saki/LyricParser"
+Repository = "https://github.com/shimo-saki/LyricParser"
+Issues = "https://github.com/shimo-saki/LyricParser/issues"
+
+[tool.setuptools.packages.find]
+include = ["LyricParser*"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["LyricParser"]
