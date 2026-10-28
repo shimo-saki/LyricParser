@@ -2,7 +2,7 @@
 
 import copy
 from dataclasses import dataclass, field
-from typing import Iterator, TypedDict
+from typing import Iterator, Literal
 
 from .options import StringifyOptions
 
@@ -47,21 +47,23 @@ class Line:
 
     Attributes:
         words: 音节列表。整行同步时只有 1 个音节。
+        start_time: 行开始时间（毫秒）；纯文本歌词为 ``None``。
+        end_time: 行结束时间（毫秒）；纯文本歌词为 ``None``。
         translated_lyric: 翻译文本；多条翻译用 ``"\\n"`` 拼接。
         roman_lyric: 整行罗马字文本。
         is_bg: 是否为背景人声。
         is_duet: 是否为对唱。
-        start_time: 行开始时间（毫秒）；纯文本歌词为 ``None``。
-        end_time: 行结束时间（毫秒）；纯文本歌词为 ``None``。
+        is_comment: 是否被注释。
     """
 
     words: list[Word] = field(default_factory=list)
+    start_time: int | None = None
+    end_time: int | None = None
     translated_lyric: str = ""
     roman_lyric: str = ""
     is_bg: bool = False
     is_duet: bool = False
-    start_time: int | None = None
-    end_time: int | None = None
+    is_comment: bool = False
 
     @property
     def text(self) -> str:
@@ -88,13 +90,11 @@ class Line:
 
         纯文本行（``start_time is None``）恒返回 ``False``。
         """
-        if self.start_time is None:
-            return False
-        if not self.words:
-            return False
-        if len(self.words) > 1:
-            return True
-        return self.words[0].start_time != self.start_time
+        return (
+            self.start_time is not None
+            and bool(self.words)
+            and (len(self.words) > 1 or self.words[0].start_time != self.start_time)
+        )
 
 
 @dataclass
@@ -105,9 +105,32 @@ class MetadataEntry:
     values: list[str] = field(default_factory=list)
 
 
-class Result(TypedDict):
-    metadata: list[MetadataEntry]
-    lines: list[Line]
+@dataclass
+class _Token:
+    """词法单元：文本片段或时间戳。
+
+    Attributes:
+        type: ``"text"`` / ``"time"`` / ``"comment"``。
+        val: 文本内容（str）或毫秒时间（int）。
+    """
+
+    type: Literal["text", "time", "comment"]
+    val: str | int
+
+
+@dataclass
+class _LineFeatures:
+    """一行歌词在词法分析后的特性。
+
+    Attributes:
+        first_text_index: 首个文本 token 的下标；-1 表示无文本。
+        is_word_sync: 是否含内联时间戳（即 ``<t>...`` 或 ``[t]...`` 形式）。
+        text: 整行拼接后的纯文本（已去除时间戳）。
+    """
+
+    text: str
+    first_text_index: int
+    is_word_sync: bool
 
 
 # ============================== Lyric ==============================
@@ -118,12 +141,12 @@ class Lyric:
     """带元数据的完整歌词集合。
 
     Attributes:
-        lines: 歌词行列表。
         metadata: 元数据条目列表。
+        lines: 歌词行列表。
     """
 
-    lines: list[Line] = field(default_factory=list)
     metadata: list[MetadataEntry] = field(default_factory=list)
+    lines: list[Line] = field(default_factory=list)
 
     def __iter__(self) -> Iterator[Line]:
         """遍历所有歌词行。
@@ -197,7 +220,7 @@ class Lyric:
 
     def to_dict(self) -> dict:
         """转换为普通字典（便于 JSON 序列化等场景）。"""
-        return {"lines": self.lines, "metadata": self.metadata}
+        return {"metadata": self.metadata, "lines": self.lines}
 
     def append(self, line: Line, *, sort: bool = True) -> None:
         """在末尾追加一条歌词行，默认自动按 ``start_time`` 排序。
@@ -261,21 +284,20 @@ class Lyric:
         # other 是同步歌词 → 按时序匹配
         grouped: dict[int | float, list[Line]] = {}
         for line in other.lines:
-            if only_main and line.is_bg:
-                continue
-            if line.start_time is None:
-                continue
-            if not line.text.strip():
+            if (
+                line.is_comment
+                or (only_main and line.is_bg)
+                or line.start_time is None
+                or not line.text.strip()
+            ):
                 continue
             grouped.setdefault(line.start_time, []).append(line)
 
         if not grouped:
             return self
 
-        self_times = {line.start_time for line in self.lines if line.start_time is not None}
-
         for line in self.lines:
-            if line.start_time is None:
+            if line.is_comment or line.start_time is None:
                 continue
             group = grouped.get(line.start_time)
             if not group:
@@ -287,11 +309,8 @@ class Lyric:
                 line.translated_lyric += "\n" + combined
 
         if not other_as_refline_only:
-            new_lines: list[Line] = []
-            for t, group in grouped.items():
-                if t in self_times:
-                    continue
-                new_lines.extend(copy.deepcopy(group))
+            self_times = {line.start_time for line in self.lines if line.start_time is not None}
+            new_lines = [line for t, group in grouped.items() if t not in self_times for line in copy.deepcopy(group)]
             if new_lines:
                 self.lines.extend(new_lines)
                 self.sort_lines()
@@ -306,7 +325,7 @@ class Lyric:
         - 逐行对应：``self.lines[i]`` 的翻译取自 ``other.lines[i].text``；
         - 空文本行（``.strip()==''``）跳过，不覆盖已有翻译；
         - ``other`` 行数多于 ``self`` 时，多出的行 deepcopy 后追加到
-          ``self.lines`` 末尾，``start_time`` / ``end_time`` 保持 ``None``。
+        ``self.lines`` 末尾，``start_time`` / ``end_time`` 保持 ``None``。
 
         Args:
             other: 纯文本歌词（``is_plain_text=True``）。
@@ -315,23 +334,19 @@ class Lyric:
         Returns:
             self。
         """
-        n_self = len(self.lines)
-        n_other = len(other.lines)
-        common = min(n_self, n_other)
+        targets = [l for l in self.lines if not l.is_comment]
+        sources = [l for l in other.lines if not l.is_comment]
 
-        for i in range(common):
-            text = other.lines[i].text
+        for target, source in zip(targets, sources):
+            text = source.text
             if not text.strip():
                 continue
-            target = self.lines[i]
             if overwrite or not target.translated_lyric:
                 target.translated_lyric = text
             else:
                 target.translated_lyric += "\n" + text
 
-        if n_other > n_self:
-            for i in range(n_self, n_other):
-                self.lines.append(copy.deepcopy(other.lines[i]))
+        self.lines.extend(copy.deepcopy(sources[len(targets) :]))
 
         return self
 
@@ -360,7 +375,7 @@ class Lyric:
         if not isinstance(other, Lyric):
             return NotImplemented
         new = copy.deepcopy(self)
-        new.combine(other)
+        new.combine(other, other_as_refline_only=False)
         return new
 
     def __radd__(self, other: object) -> "Lyric":
@@ -376,10 +391,10 @@ class Lyric:
         Returns:
             副本或合并后的新 :class:`Lyric`。
         """
-        if other == 0:
-            return copy.deepcopy(self)
         if isinstance(other, Lyric):
             return other.__add__(self)
+        if other == 0:
+            return copy.deepcopy(self)
         return NotImplemented
 
     def __iadd__(self, other: object) -> "Lyric":
@@ -402,8 +417,7 @@ class Lyric:
         """
         if not isinstance(other, Lyric):
             return NotImplemented
-        self.combine(other)
-        return self
+        return self.combine(other, other_as_refline_only=False)
 
     # ------------------------------------------------------------------
     # offset 元数据读写
@@ -421,11 +435,9 @@ class Lyric:
         """
         for entry in self.metadata:
             if entry.key.lower() == "offset":
-                if not entry.values:
-                    return 0
                 try:
-                    return int(entry.values[0])
-                except (ValueError, IndexError):
+                    return int(entry.values[0]) if entry.values else 0
+                except ValueError:
                     return 0
         return 0
 
@@ -441,12 +453,12 @@ class Lyric:
         value = int(value)
         for i, entry in enumerate(self.metadata):
             if entry.key.lower() == "offset":
-                if value == 0:
-                    del self.metadata[i]
-                else:
+                if value:
                     entry.values = [str(value)]
+                else:
+                    del self.metadata[i]
                 return
-        if value != 0:
+        if value:
             self.metadata.append(MetadataEntry("offset", [str(value)]))
 
     # ------------------------------------------------------------------
@@ -458,15 +470,11 @@ class Lyric:
         if delta_ms == 0:
             return self
         for line in self.lines:
-            if line.start_time is not None:
-                line.start_time += delta_ms
-            if line.end_time is not None:
-                line.end_time += delta_ms
-            for w in line.words:
-                if w.start_time is not None:
-                    w.start_time += delta_ms
-                if w.end_time is not None:
-                    w.end_time += delta_ms
+            for obj in (line, *line.words):
+                if obj.start_time is not None:
+                    obj.start_time += delta_ms
+                if obj.end_time is not None:
+                    obj.end_time += delta_ms
         self.offset = 0
         return self
 
@@ -497,9 +505,7 @@ class Lyric:
         """
         if not isinstance(ms, int) or ms < 0:
             raise ValueError(f"左移量必须是非负数，实际为 {ms!r}")
-        new = copy.deepcopy(self)
-        new.shift(-ms)
-        return new
+        return copy.deepcopy(self).shift(-ms)
 
     def __rshift__(self, ms: int) -> "Lyric":
         """``lyric >> ms``：返回时间戳延后 ``ms`` 的新对象。
@@ -516,49 +522,38 @@ class Lyric:
 
         if not isinstance(ms, int) or ms < 0:
             raise ValueError(f"右移量必须是非负数，实际为 {ms!r}")
-        new = copy.deepcopy(self)
-        new.shift(ms)
-        return new
+        return copy.deepcopy(self).shift(ms)
 
     # ------------------------------------------------------------------
     # 序列化
     # ------------------------------------------------------------------
 
     def stringify_lrc(self, options: StringifyOptions | dict | None = None) -> str:
-        """序列化为普通 LRC 文本。
-
-        Args:
-            ms_digits: 时间戳毫秒位数（2 或 3）。
-            include_metadata: 是否输出元数据。
-            metadata_keys: 元数据白名单（大小写不敏感）。
-
-        Returns:
-            LRC 文本。
-        """
+        """序列化为普通 LRC 文本"""
         from .lrc import stringify_lrc as _impl
 
         return _impl(self, options)
 
     def stringify_eslrc(self, options: StringifyOptions | dict | None = None) -> str:
-        """序列化为 Enhanced LRC 文本（逐字使用方括号内联时间戳）。"""
+        """序列化为 Enhanced LRC 文本（逐字使用方括号内联时间戳）"""
         from .lrc import stringify_eslrc as _impl
 
         return _impl(self, options)
 
     def stringify_enhanced_lrc(self, options: StringifyOptions | dict | None = None) -> str:
-        """序列化为 Enhanced LRC 文本（逐字使用尖括号内联时间戳）。"""
+        """序列化为 Enhanced LRC 文本（逐字使用尖括号内联时间戳）"""
         from .lrc import stringify_enhanced_lrc as _impl
 
         return _impl(self, options)
 
     def stringify_spl(self, options: StringifyOptions | dict | None = None) -> str:
-        """序列化为 SPL 文本。"""
+        """序列化为 SPL 文本"""
         from .lrc import stringify_spl as _impl
 
         return _impl(self, options)
 
     def stringify_lrc_like(self, options: StringifyOptions | dict | None = None) -> str:
-        """序列化为 LRC 家族文本。"""
+        """序列化为 LRC 家族文本"""
         from .lrc import stringify_lrc_like as _impl
 
         return _impl(self, options)

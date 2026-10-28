@@ -7,10 +7,11 @@
   角色、``amll:obscene``/``amll:empty-beat`` 属性、ruby 注音
 """
 
+from itertools import groupby
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Iterable
 
 from .models import Line, Lyric, MetadataEntry, Ruby, Word
 from .options import ParserOptions, StringifyOptions
@@ -199,8 +200,8 @@ def _normalize_text(text: str | None, trim: bool = True) -> str:
     """归一化文本：合并连续空白，可选 strip。"""
     if not text:
         return ""
-    t = MULTI_SPACE.sub(" ", text)
-    return t.strip() if trim else t
+    normalized = MULTI_SPACE.sub(" ", text)
+    return normalized.strip() if trim else normalized
 
 
 def _parse_time(s: str | None) -> int:
@@ -211,18 +212,14 @@ def _parse_time(s: str | None) -> int:
     - ``"123s"``（秒单位显式标记）
     - ``"12:34"`` / ``"1:23:45.678"``（分:秒、时:分:秒）
     """
-    if not s:
-        return 0
-    s = s.strip()
-    if not s:
+    if not (s := (s or "").strip()):
         return 0
     if s.endswith("s"):
         try:
             return round(float(s[:-1]) * 1000)
         except ValueError:
             return 0
-    m = TIME_REGEX.match(s)
-    if m:
+    if m := TIME_REGEX.match(s):
         sec = float(m.group("seconds"))
         minute = int(m.group("minutes") or 0)
         hour = int(m.group("hours") or 0)
@@ -238,68 +235,42 @@ def _format_time(ms: int, ms_digits: int = 3) -> str:
 
     ``ms_digits`` 支持 1..6；``<=3`` 截断，``>3`` 补 0。
     """
-    if ms < 0:
-        ms = 0
-    sec_total = ms // 1000
-    milli = ms % 1000
-    minute = sec_total // 60
-    sec = sec_total % 60
+    sec_total, milli = divmod(max(ms, 0), 1000)
+    minute, sec = divmod(sec_total, 60)
     frac = _format_fraction(milli, ms_digits)
-    if minute > 0:
-        return f"{minute}:{sec:02d}.{frac}"
-    return f"{sec}.{frac}"
+    return f"{minute}:{sec:02d}.{frac}" if minute else f"{sec}.{frac}"
 
 
 def _get_attr(elem: ET.Element, ns: str | None, local: str, fallback: str | None = None) -> str | None:
     """读取 XML 属性，兼容命名空间属性、fallback 属性和 local-name 匹配。"""
-    if ns is not None:
-        v = elem.get(_q(ns, local))
-        if v:
-            return v
-    if fallback:
-        v = elem.get(fallback)
-        if v:
-            return v
+    if ns is not None and (v := elem.get(_q(ns, local))):
+        return v
+    if fallback and (v := elem.get(fallback)):
+        return v
     for attr_name, attr_val in elem.attrib.items():
-        if attr_name.startswith("{"):
-            _, local_name = attr_name[1:].split("}", 1)
-        else:
-            local_name = attr_name
-        if ":" in local_name:
-            local_name = local_name.split(":", 1)[1]
-        if local_name == local:
+        name = attr_name.split("}", 1)[-1] if attr_name.startswith("{") else attr_name
+        if name.split(":", 1)[-1] == local:
             return attr_val
     return None
 
 
-def _iter_all(elem: ET.Element):
-    """深度优先遍历元素树。"""
-    yield elem
-    for child in elem:
-        yield from _iter_all(child)
-
-
 def _by_tag(elem: ET.Element, tag: str) -> list[ET.Element]:
     """按 local-name 匹配所有后代元素。"""
-    return [e for e in _iter_all(elem) if e.tag.split("}")[-1] == tag]
+    return [e for e in elem.iter() if e.tag.split("}")[-1] == tag]
 
 
 def _by_tag_ns(elem: ET.Element, ns: str, tag: str) -> list[ET.Element]:
     """按完整命名空间匹配所有后代元素。"""
-    return [e for e in _iter_all(elem) if e.tag == _q(ns, tag)]
+    return list(elem.iter(_q(ns, tag)))
 
 
 def _sort_platform_ids(ids: dict[str, list[str]]) -> dict[str, list[str]]:
     """按 AMLL 约定的优先级重排 platformIds。"""
     preferred = ["ncmMusicId", "qqMusicId", "spotifyId", "appleMusicId"]
-    ordered: dict[str, list[str]] = {}
-    for k in preferred:
-        if k in ids:
-            ordered[k] = ids[k]
-    for k, v in ids.items():
-        if k not in ordered:
-            ordered[k] = v
-    return ordered
+    return {
+        **{k: ids[k] for k in preferred if k in ids},
+        **{k: v for k, v in ids.items() if k not in preferred},
+    }
 
 
 # ============================== 解析实现 ==============================
@@ -307,6 +278,18 @@ def _sort_platform_ids(ids: dict[str, list[str]]) -> dict[str, list[str]]:
 
 class _TTMLParser:
     """TTML 内部解析器（面向 _TTMLResult）。"""
+
+    @dataclass
+    class _NodeState:
+        """``_parse_common_content`` 内的可变状态。"""
+
+        full_text: str = ""
+        words: list[Word] = field(default_factory=list)
+        translations: list[_TTMLSubContent] = field(default_factory=list)
+        romanizations: list[_TTMLSubContent] = field(default_factory=list)
+        bg_translations: list[_TTMLSubContent] = field(default_factory=list)
+        bg_romanizations: list[_TTMLSubContent] = field(default_factory=list)
+        background_vocal: _TTMLLine | None = None
 
     def __init__(self, options: StringifyOptions | dict | None = None) -> None:
         self.options: StringifyOptions = StringifyOptions.from_dict(options)
@@ -336,16 +319,13 @@ class _TTMLParser:
         metadata, sidecar = self._parse_head(doc)
         lines: list[_TTMLLine] = []
 
-        lang = _get_attr(doc, XML, "lang")
-        if lang:
+        if lang := _get_attr(doc, XML, "lang"):
             metadata.language = lang
-        timing = _get_attr(doc, ITUNES, "timing")
-        if timing in (Values.Word, Values.Line):
+        if (timing := _get_attr(doc, ITUNES, "timing")) in (Values.Word, Values.Line):
             metadata.timing_mode = timing
 
         self._parse_body(doc, lines, sidecar)
-        if not metadata.timing_mode:
-            metadata.timing_mode = self._infer_timing(lines)
+        metadata.timing_mode = metadata.timing_mode or self._infer_timing(lines)
         if metadata.platform_ids:
             metadata.platform_ids = _sort_platform_ids(metadata.platform_ids)
         return _TTMLResult(metadata=metadata, lines=lines)
@@ -353,9 +333,8 @@ class _TTMLParser:
     def _infer_timing(self, lines: list[_TTMLLine]) -> str:
         """未显式声明时，根据是否有逐字推断 timingMode。"""
         for line in lines:
-            if line.words and len(line.words) > 1:
-                return "Word"
-            if line.background_vocal and line.background_vocal.words and len(line.background_vocal.words) > 1:
+            bg = line.background_vocal
+            if len(line.words) > 1 or (bg is not None and len(bg.words) > 1):
                 return "Word"
         return "Line"
 
@@ -367,7 +346,7 @@ class _TTMLParser:
         """
         meta = _TTMLMetadata()
         sidecar: dict[str, dict[str, list[_TTMLSubContent]]] = {}
-        head = next((e for e in _iter_all(doc) if e.tag == _q(TT, "head")), None)
+        head = next((e for e in doc.iter() if e.tag == _q(TT, "head")), None)
         if head is None:
             return meta, sidecar
 
@@ -375,24 +354,18 @@ class _TTMLParser:
             if title.text:
                 meta.title.append(title.text.strip())
         for agent in _by_tag_ns(head, TTM, "agent"):
-            aid = _get_attr(agent, XML, "id")
-            if not aid:
+            if not (aid := _get_attr(agent, XML, "id")):
                 continue
-            atype = _get_attr(agent, TTM, "type") or "person"
-            names = _by_tag_ns(agent, TTM, "name")
-            a = _TTMLAgent(id=aid, type=atype)
-            if names and names[0].text:
-                nm = names[0].text.strip()
-                if nm:
-                    a.name = nm
+            a = _TTMLAgent(id=aid, type=_get_attr(agent, TTM, "type") or "person")
+            if (names := _by_tag_ns(agent, TTM, "name")) and (nm := (names[0].text or "").strip()):
+                a.name = nm
             meta.agents[aid] = a
 
         for el in _by_tag_ns(head, AMLL, "meta"):
             key = _get_attr(el, AMLL, "key")
-            val = _get_attr(el, AMLL, "value")
+            val = _get_attr(el, AMLL, "value").strip()
             if not key or not val:
                 continue
-            val = val.strip()
             if key == Values.MusicName:
                 meta.title.append(val)
             elif key == Values.Artists:
@@ -412,17 +385,11 @@ class _TTMLParser:
 
         self._parse_itunes(head, meta, sidecar)
 
-        meta.title = list(dict.fromkeys(meta.title))
-        meta.artist = list(dict.fromkeys(meta.artist))
-        meta.album = list(dict.fromkeys(meta.album))
-        meta.isrc = list(dict.fromkeys(meta.isrc))
-        meta.author_ids = list(dict.fromkeys(meta.author_ids))
-        meta.author_names = list(dict.fromkeys(meta.author_names))
-        meta.songwriters = list(dict.fromkeys(meta.songwriters))
-        for k, v in list(meta.platform_ids.items()):
-            meta.platform_ids[k] = list(dict.fromkeys(v))
-        for k, v in list(meta.raw_properties.items()):
-            meta.raw_properties[k] = list(dict.fromkeys(v))
+        for name in ("title", "artist", "album", "isrc", "author_ids", "author_names", "songwriters"):
+            setattr(meta, name, list(dict.fromkeys(getattr(meta, name))))
+        for mapping in (meta.platform_ids, meta.raw_properties):
+            for k, v in mapping.items():
+                mapping[k] = list(dict.fromkeys(v))
 
         return meta, sidecar
 
@@ -430,83 +397,67 @@ class _TTMLParser:
         self, head: ET.Element, meta: _TTMLMetadata, sidecar: dict[str, dict[str, list[_TTMLSubContent]]]
     ) -> None:
         """解析 ``<iTunesMetadata>`` 下的扩展元素。"""
-        itunes_metas = _by_tag(head, "iTunesMetadata")
-        if not itunes_metas:
-            return
-        for itunes in itunes_metas:
-            sw = _by_tag(itunes, "songwriters")
-            if sw:
+        for itunes in _by_tag(head, "iTunesMetadata"):
+            if sw := _by_tag(itunes, "songwriters"):
                 for w in _by_tag(sw[0], "songwriter"):
                     if w.text:
                         meta.songwriters.append(w.text.strip())
 
-            def process(container_tag: str, item_tag: str, key: str) -> None:
-                container = _by_tag(itunes, container_tag)
-                if not container:
-                    return
+            for container_tag, item_tag, key, bg_key in (
+                ("translations", "translation", "translations", "bgTranslations"),
+                ("transliterations", "transliteration", "romanizations", "bgRomanizations"),
+            ):
+                if not (container := _by_tag(itunes, container_tag)):
+                    continue
                 for item in _by_tag(container[0], item_tag):
                     lang = _get_attr(item, XML, "lang")
                     for text_node in _by_tag(item, "text"):
-                        fid = text_node.get("for")
-                        parsed = self._parse_common_content(text_node)
-                        if not fid:
+                        if not (fid := text_node.get("for")):
                             continue
-                        sub = self._extract_sub_content(parsed, lang, False)
-                        sidecar.setdefault(fid, {})
+                        sub = self._extract_sub_content(self._parse_common_content(text_node), lang, False)
+                        entry = sidecar.setdefault(fid, {})
                         if sub.get("main"):
-                            sidecar[fid].setdefault(key, []).append(sub["main"])
+                            entry.setdefault(key, []).append(sub["main"])
                         if sub.get("bg"):
-                            bg_key = "bgTranslations" if key == "translations" else "bgRomanizations"
-                            sidecar[fid].setdefault(bg_key, []).append(sub["bg"])
-
-            process("translations", "translation", "translations")
-            process("transliterations", "transliteration", "romanizations")
+                            entry.setdefault(bg_key, []).append(sub["bg"])
 
     def _extract_sub_content(
         self, base: _TTMLLine, lang: str | None, ignore_words: bool = False
     ) -> dict[str, _TTMLSubContent]:
         """从行对象提取主/背景子内容，用于 sidecar 展开。"""
         result: dict[str, _TTMLSubContent] = {}
-        main_text = _normalize_text(base.text)
-        has_words = (not ignore_words) and base.words and len(base.words) > 0
-        if main_text or has_words:
-            main = _TTMLSubContent(text=main_text, language=lang)
-            if has_words:
-                w = base.words
-                if not (len(w) == 1 and w[0].start_time == 0 and w[0].end_time == 0):
-                    main.words = w
-            result["main"] = main
-        bg = base.background_vocal
-        if bg:
-            bg_text = _normalize_text(bg.text)
-            has_bg_words = (not ignore_words) and bg.words
-            if bg_text or has_bg_words:
-                b = _TTMLSubContent(text=bg_text, language=lang)
-                if has_bg_words:
-                    if not (len(bg.words) == 1 and bg.words[0].start_time == 0 and bg.words[0].end_time == 0):
-                        b.words = bg.words
-                result["bg"] = b
+        for key, src in (("main", base), ("bg", base.background_vocal)):
+            if src is None:
+                continue
+            text = _normalize_text(src.text)
+            words = src.words if not ignore_words else None
+            if not (text or words):
+                continue
+            sub = _TTMLSubContent(text=text, language=lang)
+            if words and not (len(words) == 1 and words[0].start_time == words[0].end_time == 0):
+                sub.words = words
+            result[key] = sub
         return result
 
     def _parse_body(
         self, doc: ET.Element, lines: list[_TTMLLine], sidecar: dict[str, dict[str, list[_TTMLSubContent]]]
     ) -> None:
         """解析 body 中的 div/p 结构。"""
-        body = next((e for e in _iter_all(doc) if e.tag == _q(TT, "body")), None)
-        if body is None:
+        if (body := next((e for e in doc.iter() if e.tag == _q(TT, "body")), None)) is None:
             return
         block_index = 0
-        for el in list(body):
-            tag = el.tag.split("}")[-1] if "}" in el.tag else el.tag
+        for el in body:
+            tag = el.tag.split("}")[-1]
+            if tag not in ("div", "p"):
+                continue
+            block_index += 1
             if tag == "div":
-                block_index += 1
                 song_part = _get_attr(el, ITUNES, "song-part") or _get_attr(el, ITUNES, "songPart")
-                p_nodes = _by_tag_ns(el, TT, "p") or _by_tag(el, "p")
-                for p in p_nodes:
-                    self._process_line(p, lines, sidecar, song_part, block_index)
-            elif tag == "p":
-                block_index += 1
-                self._process_line(el, lines, sidecar, None, block_index)
+                nodes = _by_tag_ns(el, TT, "p") or _by_tag(el, "p")
+            else:
+                song_part, nodes = None, [el]
+            for p in nodes:
+                self._process_line(p, lines, sidecar, song_part, block_index)
 
     def _process_line(
         self,
@@ -517,47 +468,38 @@ class _TTMLParser:
         block_index: int,
     ) -> None:
         """处理单个 ``<p>``：解析内容并挂载 sidecar 中的翻译/罗马字。"""
-        lid = _get_attr(p, ITUNES, "key")
-        if not lid:
+        if not (lid := _get_attr(p, ITUNES, "key")):
             return
         content = self._parse_common_content(p)
         content.id = lid
-        if song_part:
-            content.song_part = song_part
+        content.song_part = song_part or content.song_part
         content.block_index = block_index
-        agent = _get_attr(p, TTM, "agent")
-        if agent:
-            content.agent_id = agent
-        ext = sidecar.get(lid)
-        if ext:
-            if ext.get("translations"):
-                content.translations = (content.translations or []) + ext["translations"]
-            if ext.get("romanizations"):
-                content.romanizations = (content.romanizations or []) + ext["romanizations"]
-            bg = content.background_vocal
-            if ext.get("bgTranslations") and bg:
-                bg.translations = (bg.translations or []) + ext["bgTranslations"]
-            if ext.get("bgRomanizations") and bg:
-                bg.romanizations = (bg.romanizations or []) + ext["bgRomanizations"]
+        content.agent_id = _get_attr(p, TTM, "agent") or content.agent_id
+        if ext := sidecar.get(lid):
+            if vals := ext.get("translations"):
+                content.translations = (content.translations or []) + vals
+            if vals := ext.get("romanizations"):
+                content.romanizations = (content.romanizations or []) + vals
+            if bg := content.background_vocal:
+                if vals := ext.get("bgTranslations"):
+                    bg.translations = (bg.translations or []) + vals
+                if vals := ext.get("bgRomanizations"):
+                    bg.romanizations = (bg.romanizations or []) + vals
         lines.append(content)
 
     def _parse_common_content(self, element: ET.Element) -> _TTMLLine:
         """解析元素主体（文本 + 音节 + 角色标记）。"""
         begin = _get_attr(element, XML, "begin") or element.get("begin")
         end = _get_attr(element, XML, "end") or element.get("end")
-        orig_start = _parse_time(begin) if begin else 0
-        orig_end = _parse_time(end) if end else 0
+        orig_start = _parse_time(begin)
+        orig_end = _parse_time(end)
 
         state = self._extract_node_state(element)
-        if state.background_vocal:
+        if bg := state.background_vocal:
             if state.bg_translations:
-                state.background_vocal.translations = (
-                    state.background_vocal.translations or []
-                ) + state.bg_translations
+                bg.translations = (bg.translations or []) + state.bg_translations
             if state.bg_romanizations:
-                state.background_vocal.romanizations = (
-                    state.background_vocal.romanizations or []
-                ) + state.bg_romanizations
+                bg.romanizations = (bg.romanizations or []) + state.bg_romanizations
         _finalize_words(state.words)
 
         start, end_time = self._calc_time(orig_start, orig_end, state.words, state.background_vocal)
@@ -569,23 +511,11 @@ class _TTMLParser:
             start_time=start,
             end_time=end_time,
             text=clean,
-            words=state.words if state.words else None,
-            translations=state.translations if state.translations else None,
-            romanizations=state.romanizations if state.romanizations else None,
+            words=state.words or None,
+            translations=state.translations or None,
+            romanizations=state.romanizations or None,
             background_vocal=state.background_vocal,
         )
-
-    @dataclass
-    class _NodeState:
-        """``_parse_common_content`` 内的可变状态。"""
-
-        full_text: str = ""
-        words: list[Word] = field(default_factory=list)
-        translations: list[_TTMLSubContent] = field(default_factory=list)
-        romanizations: list[_TTMLSubContent] = field(default_factory=list)
-        bg_translations: list[_TTMLSubContent] = field(default_factory=list)
-        bg_romanizations: list[_TTMLSubContent] = field(default_factory=list)
-        background_vocal: _TTMLLine | None = None
 
     def _extract_node_state(self, element: ET.Element) -> "_TTMLParser._NodeState":
         """遍历元素（含文本节点）收集文本、音节、角色内容。"""
@@ -600,74 +530,65 @@ class _TTMLParser:
 
     def _process_text(self, state: "_TTMLParser._NodeState", raw_text: str) -> None:
         """处理纯文本节点（仅累加至 fullText）。"""
-        is_fmt = "\n" in raw_text
-        if is_fmt and not raw_text.strip():
+        if "\n" in raw_text and not raw_text.strip():
             return
-        norm = _normalize_text(raw_text, trim=False)
-        state.full_text += norm
+        state.full_text += _normalize_text(raw_text, trim=False)
 
     def _process_element(self, state: "_TTMLParser._NodeState", el: ET.Element) -> None:
         """根据 role/ruby 属性分发元素处理。"""
-        role = _get_attr(el, TTM, "role")
-        ruby_attr = _get_attr(el, TTS, "ruby")
-        if ruby_attr == Values.RubyContainer:
+        if _get_attr(el, TTS, "ruby") == Values.RubyContainer:
             self._process_ruby(state, el)
             return
+        role = _get_attr(el, TTM, "role")
         if role == Values.RoleBg:
             state.background_vocal = self._parse_bg(el)
-        elif role == Values.RoleTranslation:
-            trans = self._parse_inline_sub(el)
-            if trans:
-                if trans.get("main"):
-                    state.translations.append(trans["main"])
-                if trans.get("bg"):
-                    state.bg_translations.append(trans["bg"])
-        elif role == Values.RoleRoman:
-            roman = self._parse_inline_sub(el)
-            if roman:
-                if roman.get("main"):
-                    state.romanizations.append(roman["main"])
-                if roman.get("bg"):
-                    state.bg_romanizations.append(roman["bg"])
-        else:
-            self._process_word(state, el)
+            return
+        for role_val, main_list, bg_list in (
+            (Values.RoleTranslation, state.translations, state.bg_translations),
+            (Values.RoleRoman, state.romanizations, state.bg_romanizations),
+        ):
+            if role == role_val:
+                if sub := self._parse_inline_sub(el):
+                    if sub.get("main"):
+                        main_list.append(sub["main"])
+                    if sub.get("bg"):
+                        bg_list.append(sub["bg"])
+                return
+        self._process_word(state, el)
 
     def _process_ruby(self, state: "_TTMLParser._NodeState", container: ET.Element) -> None:
         """解析 ruby 容器（base + 一组带时间的 rt）。"""
         is_obscene = _get_attr(container, AMLL, "obscene") == "true"
-        empty_beat_attr = _get_attr(container, AMLL, "empty-beat")
-        empty_beat = int(empty_beat_attr) if empty_beat_attr and empty_beat_attr.isdigit() else None
+        eb = _get_attr(container, AMLL, "empty-beat")
+        empty_beat = int(eb) if eb and eb.isdigit() else None
 
         base_text = ""
         ruby_tags: list[Ruby] = []
-        for child in list(container):
+        for child in container:
             ruby_attr = _get_attr(child, TTS, "ruby")
             if ruby_attr == Values.RubyBase:
-                base_text = _normalize_text(child.text or "", trim=False)
+                base_text = _normalize_text(child.text, trim=False)
             elif ruby_attr == Values.RubyTextContainer:
-                for rt in list(child):
+                for rt in child:
                     if _get_attr(rt, TTS, "ruby") != Values.RubyText:
                         continue
                     b = _get_attr(rt, XML, "begin")
                     e = _get_attr(rt, XML, "end")
-                    txt = _normalize_text(rt.text or "", trim=False).strip()
+                    txt = _normalize_text(rt.text, trim=False).strip()
                     if txt and b and e:
                         ruby_tags.append(Ruby(word=txt, start_time=_parse_time(b), end_time=_parse_time(e)))
 
         if not base_text:
             return
         state.full_text += base_text
-        start = min((r.start_time for r in ruby_tags), default=0)
-        end = max((r.end_time for r in ruby_tags), default=0)
-        clean = base_text.strip()
-        if clean:
+        if clean := base_text.strip():
             state.words.append(
                 Word(
                     word=clean,
-                    start_time=start,
-                    end_time=end,
-                    ruby=ruby_tags if ruby_tags else None,
-                    obscene=True if is_obscene else None,
+                    start_time=min((r.start_time for r in ruby_tags), default=0),
+                    end_time=max((r.end_time for r in ruby_tags), default=0),
+                    ruby=ruby_tags or None,
+                    obscene=is_obscene or None,
                     empty_beat=empty_beat,
                 )
             )
@@ -677,24 +598,21 @@ class _TTMLParser:
         wb = _get_attr(el, XML, "begin")
         we = _get_attr(el, XML, "end")
         is_obscene = _get_attr(el, AMLL, "obscene") == "true"
-        empty_beat_attr = _get_attr(el, AMLL, "empty-beat")
-        empty_beat = int(empty_beat_attr) if empty_beat_attr and empty_beat_attr.isdigit() else None
-        raw = el.text or ""
-        norm = _normalize_text(raw, trim=False)
+        eb = _get_attr(el, AMLL, "empty-beat")
+        empty_beat = int(eb) if eb and eb.isdigit() else None
+        norm = _normalize_text(el.text, trim=False)
         state.full_text += norm
-        if wb and we:
-            clean = norm.strip()
-            if clean:
-                state.words.append(
-                    Word(
-                        word=clean,
-                        start_time=_parse_time(wb),
-                        end_time=_parse_time(we),
-                        obscene=True if is_obscene else None,
-                        empty_beat=empty_beat,
-                    )
+        if wb and we and (clean := norm.strip()):
+            state.words.append(
+                Word(
+                    word=clean,
+                    start_time=_parse_time(wb),
+                    end_time=_parse_time(we),
+                    obscene=is_obscene or None,
+                    empty_beat=empty_beat,
                 )
-        for child in list(el):
+            )
+        for child in el:
             self._process_element(state, child)
             if child.tail:
                 self._process_text(state, child.tail)
@@ -703,10 +621,8 @@ class _TTMLParser:
         """解析背景人声元素，去掉首尾括号。"""
         content = self._parse_common_content(el)
         content.background_vocal = None
-        content.text = re.sub(r"^[(（]+", "", content.text)
-        content.text = re.sub(r"[)）]+$", "", content.text)
-        words = content.words
-        if words:
+        content.text = re.sub(r"^[(（]+|[)）]+$", "", content.text)
+        if words := content.words:
             words[0].word = re.sub(r"^[(（]+", "", words[0].word).lstrip()
             words[-1].word = re.sub(r"[)）]+$", "", words[-1].word).rstrip()
         return content
@@ -714,24 +630,18 @@ class _TTMLParser:
     def _parse_inline_sub(self, el: ET.Element) -> dict[str, _TTMLSubContent] | None:
         """解析行内 translation/roman 角色。"""
         lang = _get_attr(el, XML, "lang")
-        parsed = self._parse_common_content(el)
-        content = self._extract_sub_content(parsed, lang, True)
-        return content if (content.get("main") or content.get("bg")) else None
+        content = self._extract_sub_content(self._parse_common_content(el), lang, True)
+        return content or None
 
     def _calc_time(self, orig_start: int, orig_end: int, words: list[Word], bg: _TTMLLine | None) -> tuple[int, int]:
         """当行无显式时间时，根据子节点时间推导行时间。"""
-        start, end = orig_start, orig_end
-        timed = list(words)
-        if bg:
-            timed.append(bg)
-        if timed:
-            min_start = min((t.start_time for t in timed), default=float("inf"))
-            max_end = max((t.end_time for t in timed), default=0)
-            if start == 0 or (min_start > 0 and min_start < start):
-                start = 0 if min_start == float("inf") else min_start
-            if end == 0 or max_end > end:
-                end = max_end
-        return start, end
+        timed = [*words, bg] if bg else words
+        if not timed:
+            return orig_start, orig_end
+        min_start = min(t.start_time for t in timed)
+        max_end = max(t.end_time for t in timed)
+        start = min_start if orig_start == 0 or 0 < min_start < orig_start else orig_start
+        return start, max(orig_end, max_end)
 
     def _apply_fallback(
         self,
@@ -769,10 +679,10 @@ class _TTMLGenerator:
     """TTML 内部生成器（面向 _TTMLResult）。"""
 
     def __init__(self, options: StringifyOptions | dict | None = None) -> None:
-        self.options: StringifyOptions = StringifyOptions.from_dict(options)
-        self.ms_digits: int = self.options.ms_digits
-        self.include_metadata: bool = self.options.include_metadata
-        self.metadata_keys: frozenset[str] | None  = self.options.metadata_keys
+        self.options = StringifyOptions.from_dict(options)
+        self.ms_digits = self.options.ms_digits
+        self.include_metadata = self.options.include_metadata
+        self.metadata_keys = self.options.metadata_keys
 
     def _fmt(self, ms: int) -> str:
         """以当前 ms_digits 格式化时间。"""
@@ -783,12 +693,11 @@ class _TTMLGenerator:
         meta = result.metadata
         lines = result.lines
 
-        all_have_id = all(line.id for line in lines)
-        for i, line in enumerate(lines):
-            if not all_have_id:
-                line.id = f"L{i + 1}"
-            if not line.agent_id:
-                line.agent_id = Values.AgentDefault
+        if not all(line.id for line in lines):
+            for i, line in enumerate(lines, 1):
+                line.id = f"L{i}"
+        for line in lines:
+            line.agent_id = line.agent_id or Values.AgentDefault
 
         root = ET.Element(_q(TT, "tt"))
         if meta.language:
@@ -807,17 +716,13 @@ class _TTMLGenerator:
         head = ET.Element(_q(TT, "head"))
         metadata = ET.SubElement(head, _q(TTM, "metadata"))
 
-        agents = meta.agents
-        if not agents:
-            unique = {line.agent_id for line in result.lines if line.agent_id}
-            agents = {
-                aid: _TTMLAgent(
-                    id=aid,
-                    type=Values.Group if aid == Values.AgentGroup else Values.Person,
-                )
-                for aid in unique
-            }
-
+        agents = meta.agents or {
+            aid: _TTMLAgent(
+                id=aid,
+                type=Values.Group if aid == Values.AgentGroup else Values.Person,
+            )
+            for aid in {line.agent_id for line in result.lines if line.agent_id}
+        }
         for aid, agent in agents.items():
             el = ET.SubElement(metadata, _q(TTM, "agent"))
             el.set("type", agent.type)
@@ -829,36 +734,26 @@ class _TTMLGenerator:
 
         self._build_itunes_metadata(metadata, result)
 
-        def add_meta(key: str, value: str) -> None:
-            stripped = value.strip()
-            if not stripped:
-                return
-            if key.lower() == "offset" and stripped == "0":
-                return
-            if self.metadata_keys is not None and key not in self.metadata_keys:
-                return
-            el = ET.SubElement(metadata, _q(AMLL, "meta"))
-            el.set("key", key)
-            el.set("value", value)
-
-        for v in meta.title:
-            add_meta(Values.MusicName, v)
-        for v in meta.artist:
-            add_meta(Values.Artists, v)
-        for v in meta.album:
-            add_meta(Values.Album, v)
-        for k, vals in meta.platform_ids.items():
-            for v in vals:
-                add_meta(k, v)
-        for v in meta.isrc:
-            add_meta(Values.ISRC, v)
-        for v in meta.author_ids:
-            add_meta(Values.TTMLAuthorGithub, v)
-        for v in meta.author_names:
-            add_meta(Values.TTMLAuthorGithubLogin, v)
-        for k, vals in meta.raw_properties.items():
-            for v in vals:
-                add_meta(k, v)
+        for key, values in (
+            (Values.MusicName, meta.title),
+            (Values.Artists, meta.artist),
+            (Values.Album, meta.album),
+            (Values.ISRC, meta.isrc),
+            (Values.TTMLAuthorGithub, meta.author_ids),
+            (Values.TTMLAuthorGithubLogin, meta.author_names),
+            *meta.platform_ids.items(),
+            *meta.raw_properties.items(),
+        ):
+            for value in values:
+                if not (stripped := value.strip()):
+                    continue
+                if key.lower() == "offset" and stripped == "0":
+                    continue
+                if self.metadata_keys is not None and key not in self.metadata_keys:
+                    continue
+                el = ET.SubElement(metadata, _q(AMLL, "meta"))
+                el.set("key", key)
+                el.set("value", value)
         return head
 
     def _should_sidecar(self, content: _TTMLSubContent) -> bool:
@@ -867,159 +762,113 @@ class _TTMLGenerator:
 
     def _build_itunes_metadata(self, metadata_el: ET.Element, result: _TTMLResult) -> None:
         """构建 ``<iTunesMetadata>``：翻译、罗马字、词曲作者。"""
-        itunes = ET.SubElement(metadata_el, _q(ITUNES, "iTunesMetadata"))
-        itunes.set("xmlns", NS["ITUNES"])
-        has_content = False
-
         trans_map: dict[str | None, list[dict[str, Any]]] = {}
         roman_map: dict[str | None, list[dict[str, Any]]] = {}
-        for line in result.lines:
-            for pair in self._pair_sub_contents(
-                line.translations, (line.background_vocal.translations if line.background_vocal else None)
-            ):
-                if (pair.get("main") and self._should_sidecar(pair["main"])) or (
-                    pair.get("bg") and self._should_sidecar(pair["bg"])
-                ):
-                    trans_map.setdefault(pair["lang"], []).append(
-                        {"id": line.id, "main": pair.get("main"), "bg": pair.get("bg")}
-                    )
-            for pair in self._pair_sub_contents(
-                line.romanizations, (line.background_vocal.romanizations if line.background_vocal else None)
-            ):
-                if (pair.get("main") and self._should_sidecar(pair["main"])) or (
-                    pair.get("bg") and self._should_sidecar(pair["bg"])
-                ):
-                    roman_map.setdefault(pair["lang"], []).append(
-                        {"id": line.id, "main": pair.get("main"), "bg": pair.get("bg")}
-                    )
+        for attr, out in (("translations", trans_map), ("romanizations", roman_map)):
+            for line in result.lines:
+                bg = line.background_vocal
+                pairs = self._pair_sub_contents(getattr(line, attr), getattr(bg, attr) if bg else None)
+                for pair in pairs:
+                    if (pair.get("main") and self._should_sidecar(pair["main"])) or (
+                        pair.get("bg") and self._should_sidecar(pair["bg"])
+                    ):
+                        out.setdefault(pair["lang"], []).append(
+                            {"id": line.id, "main": pair.get("main"), "bg": pair.get("bg")}
+                        )
 
-        if trans_map:
-            container = ET.SubElement(itunes, "translations")
-            for lang, items in trans_map.items():
-                trans_el = ET.SubElement(container, "translation")
+        songwriters = result.metadata.songwriters
+        if not (trans_map or roman_map or songwriters):
+            return
+
+        itunes = ET.SubElement(metadata_el, _q(ITUNES, "iTunesMetadata"))
+        itunes.set("xmlns", NS["ITUNES"])
+
+        for tag, container_tag, mapping in (
+            ("translation", "translations", trans_map),
+            ("transliteration", "transliterations", roman_map),
+        ):
+            if not mapping:
+                continue
+            container = ET.SubElement(itunes, container_tag)
+            for lang, items in mapping.items():
+                el = ET.SubElement(container, tag)
                 if lang:
-                    trans_el.set(_q(XML, "lang"), lang)
+                    el.set(_q(XML, "lang"), lang)
                 for item in items:
-                    text_el = ET.SubElement(trans_el, "text")
+                    text_el = ET.SubElement(el, "text")
                     text_el.set("for", item["id"])
                     if item.get("main"):
-                        self._append_content(text_el, item["main"])
+                        self._append_sub_content(text_el, item["main"])
                     if item.get("bg"):
                         self._append_bg(text_el, item["bg"])
-            has_content = True
 
-        if roman_map:
-            container = ET.SubElement(itunes, "transliterations")
-            for lang, items in roman_map.items():
-                trans_el = ET.SubElement(container, "transliteration")
-                if lang:
-                    trans_el.set(_q(XML, "lang"), lang)
-                for item in items:
-                    text_el = ET.SubElement(trans_el, "text")
-                    text_el.set("for", item["id"])
-                    if item.get("main"):
-                        self._append_content(text_el, item["main"])
-                    if item.get("bg"):
-                        self._append_bg(text_el, item["bg"])
-            has_content = True
-
-        if result.metadata.songwriters:
+        if songwriters:
             container = ET.SubElement(itunes, "songwriters")
-            for name in result.metadata.songwriters:
-                sw = ET.SubElement(container, "songwriter")
-                sw.text = name
-            has_content = True
-
-        if not has_content:
-            metadata_el.remove(itunes)
+            for name in songwriters:
+                ET.SubElement(container, "songwriter").text = name
 
     def _pair_sub_contents(
         self, main_list: list[_TTMLSubContent] | None, bg_list: list[_TTMLSubContent] | None
     ) -> list[dict[str, Any]]:
         """按语言把主/背景翻译配对。"""
         out: dict[str | None, dict[str, Any]] = {}
-        for item in main_list or []:
-            entry = out.setdefault(item.language, {"lang": item.language})
-            entry["main"] = item
-        for item in bg_list or []:
-            entry = out.setdefault(item.language, {"lang": item.language})
-            entry["bg"] = item
+        for key, items in (("main", main_list), ("bg", bg_list)):
+            for item in items or ():
+                out.setdefault(item.language, {"lang": item.language})[key] = item
         return list(out.values())
 
     def _build_body(self, result: _TTMLResult) -> ET.Element:
         """构建 ``<body>``，按 song_part/block_index 分组。"""
-        body = ET.Element(_q(TT, "body"))
         lines = result.lines
-        last_time = max((l.end_time for l in lines), default=0)
-        body.set("dur", self._fmt(last_time))
+        body = ET.Element(_q(TT, "body"), dur=self._fmt(max((l.end_time for l in lines), default=0)))
 
-        current_div: ET.Element | None = None
-        current_part: str | None = None
-        current_block: int | None = None
-        section_end = 0
-
-        def finalize() -> None:
-            nonlocal current_div, section_end, current_part
-            if current_div is not None and section_end > 0:
-                current_div.set("end", self._fmt(section_end))
-                if current_part:
-                    current_div.set(_q(ITUNES, "songPart"), current_part)
-
-        for line in lines:
-            if line.song_part != current_part or line.block_index != current_block or current_div is None:
-                finalize()
-                current_part = line.song_part
-                current_block = line.block_index
-                section_end = 0
-                current_div = ET.SubElement(body, _q(TT, "div"))
-                current_div.set("begin", self._fmt(line.start_time))
-            if line.end_time > section_end:
-                section_end = line.end_time
-            p = ET.SubElement(current_div, _q(TT, "p"))
-            p.set("begin", self._fmt(line.start_time))
-            p.set("end", self._fmt(line.end_time))
-            p.set(_q(ITUNES, "key"), line.id)
-            if line.agent_id:
-                p.set(_q(TTM, "agent"), line.agent_id)
-            self._append_line_content(p, line)
-        finalize()
+        for (part, _), group in groupby(lines, key=lambda l: (l.song_part, l.block_index)):
+            items = list(group)
+            div = ET.SubElement(body, _q(TT, "div"))
+            div.set("begin", self._fmt(items[0].start_time))
+            if (section_end := max(l.end_time for l in items)) > 0:
+                div.set("end", self._fmt(section_end))
+            if part:
+                div.set(_q(ITUNES, "songPart"), part)
+            for line in items:
+                p = ET.SubElement(div, _q(TT, "p"))
+                p.set("begin", self._fmt(line.start_time))
+                p.set("end", self._fmt(line.end_time))
+                p.set(_q(ITUNES, "key"), line.id)
+                if line.agent_id:
+                    p.set(_q(TTM, "agent"), line.agent_id)
+                self._append_line_content(p, line)
         return body
 
     def _append_line_content(self, element: ET.Element, content: _TTMLLine) -> None:
         """向 ``<p>`` 或嵌套 span 追加文本、音节、翻译、罗马字、bg。"""
-        if content.words:
-            self._append_words(element, content.words, False)
-        else:
-            element.text = (element.text or "") + (content.text or "")
+        self._append_sub_content(element, content)
 
-        for trans in content.translations or []:
-            if not self._should_sidecar(trans):
+        for items, role in (
+            (content.translations, Values.RoleTranslation),
+            (content.romanizations, Values.RoleRoman),
+        ):
+            for sub in items or ():
+                if self._should_sidecar(sub):
+                    continue
                 span = ET.SubElement(element, _q(TT, "span"))
-                span.set(_q(TTM, "role"), Values.RoleTranslation)
-                if trans.language:
-                    span.set(_q(XML, "lang"), trans.language)
-                self._append_sub_content(span, trans)
-
-        for roman in content.romanizations or []:
-            if not self._should_sidecar(roman):
-                span = ET.SubElement(element, _q(TT, "span"))
-                span.set(_q(TTM, "role"), Values.RoleRoman)
-                if roman.language:
-                    span.set(_q(XML, "lang"), roman.language)
-                self._append_sub_content(span, roman)
+                span.set(_q(TTM, "role"), role)
+                if sub.language:
+                    span.set(_q(XML, "lang"), sub.language)
+                self._append_sub_content(span, sub)
 
         if content.background_vocal:
             self._append_bg(element, content.background_vocal)
 
     def _append_sub_content(self, element: ET.Element, content: _TTMLSubContent) -> None:
-        """追加一段子内容（逐字或纯文本）。"""
+        """追加一段子内容"""
         if content.words:
             self._append_words(element, content.words, False)
         else:
             element.text = (element.text or "") + (content.text or "")
 
     def _append_bg(self, element: ET.Element, bg: _TTMLLine) -> None:
-        """追加一段背景人声 span。"""
+        """追加一段背景人声 span"""
         span = ET.SubElement(element, _q(TT, "span"))
         span.set(_q(TTM, "role"), Values.RoleBg)
         if bg.start_time > 0 and bg.end_time > 0:
@@ -1027,50 +876,40 @@ class _TTMLGenerator:
             span.set("end", self._fmt(bg.end_time))
         self._append_line_content(span, bg)
 
-    def _append_content(self, element: ET.Element, content: _TTMLSubContent) -> None:
-        """追加侧栏内容（仅文本或音节）。"""
-        if content.words:
-            self._append_words(element, content.words, False)
-        else:
-            text = content.text or ""
-            element.text = (element.text or "") + text
-
     def _append_words(self, element: ET.Element, words: list[Word], is_bg: bool) -> None:
-        """追加音节序列（含 ruby 支持）。"""
+        """追加音节序列（含 ruby 支持）"""
+        last = len(words) - 1
         for i, syl in enumerate(words):
             text = syl.word
-            if is_bg:
-                if i == 0:
-                    text = f"({text}"
-                if i == len(words) - 1:
-                    text = f"{text})"
-            if syl.ruby:
-                container = ET.SubElement(element, _q(TT, "span"))
-                container.set(_q(TTS, "ruby"), Values.RubyContainer)
-                if syl.obscene:
-                    container.set(_q(AMLL, "obscene"), Values.TRUE_)
-                if syl.empty_beat is not None:
-                    container.set(_q(AMLL, "empty-beat"), str(syl.empty_beat))
-                base = ET.SubElement(container, _q(TT, "span"))
-                base.set(_q(TTS, "ruby"), Values.RubyBase)
-                base.text = text
-                tc = ET.SubElement(container, _q(TT, "span"))
-                tc.set(_q(TTS, "ruby"), Values.RubyTextContainer)
-                for r in syl.ruby:
-                    rt = ET.SubElement(tc, _q(TT, "span"))
-                    rt.set(_q(TTS, "ruby"), Values.RubyText)
-                    rt.set("begin", self._fmt(r.start_time))
-                    rt.set("end", self._fmt(r.end_time))
-                    rt.text = r.word
-            else:
-                span = ET.SubElement(element, _q(TT, "span"))
-                span.set("begin", self._fmt(syl.start_time))
-                span.set("end", self._fmt(syl.end_time))
-                if syl.obscene:
-                    span.set(_q(AMLL, "obscene"), Values.TRUE_)
-                if syl.empty_beat is not None:
-                    span.set(_q(AMLL, "empty-beat"), str(syl.empty_beat))
-                span.text = text
+            if is_bg and i == 0:
+                text = f"({text}"
+            if is_bg and i == last:
+                text = f"{text})"
+
+            outer = ET.SubElement(element, _q(TT, "span"))
+            if syl.obscene:
+                outer.set(_q(AMLL, "obscene"), Values.TRUE_)
+            if syl.empty_beat is not None:
+                outer.set(_q(AMLL, "empty-beat"), str(syl.empty_beat))
+
+            if not syl.ruby:
+                outer.set("begin", self._fmt(syl.start_time))
+                outer.set("end", self._fmt(syl.end_time))
+                outer.text = text
+                continue
+
+            outer.set(_q(TTS, "ruby"), Values.RubyContainer)
+            base = ET.SubElement(outer, _q(TT, "span"))
+            base.set(_q(TTS, "ruby"), Values.RubyBase)
+            base.text = text
+            tc = ET.SubElement(outer, _q(TT, "span"))
+            tc.set(_q(TTS, "ruby"), Values.RubyTextContainer)
+            for r in syl.ruby:
+                rt = ET.SubElement(tc, _q(TT, "span"))
+                rt.set(_q(TTS, "ruby"), Values.RubyText)
+                rt.set("begin", self._fmt(r.start_time))
+                rt.set("end", self._fmt(r.end_time))
+                rt.text = r.word
 
 
 # ============================== 转换 ==============================
@@ -1089,7 +928,6 @@ def _to_lyrics(result: _TTMLResult, options: ParserOptions | dict | None = None)
         公共 :class:`Lyric` 对象。
     """
 
-    lines: list[Line] = []
     opts = ParserOptions.from_dict(options)
 
     def convert(source: _TTMLLine, is_bg: bool, is_duet: bool) -> Line:
@@ -1111,10 +949,10 @@ def _to_lyrics(result: _TTMLResult, options: ParserOptions | dict | None = None)
 
         trans_text = ""
         if source.translations:
-            selected = next(
-                (t for t in source.translations if t.language == opts.translation_language), source.translations[0]
-            )
-            trans_text = selected.text
+            trans_text = next(
+                (t for t in source.translations if t.language == opts.translation_language),
+                source.translations[0],
+            ).text
 
         roman_text = ""
         roman_words: list[Word] | None = None
@@ -1139,59 +977,53 @@ def _to_lyrics(result: _TTMLResult, options: ParserOptions | dict | None = None)
         )
 
     agents = result.metadata.agents
+    lines: list[Line] = []
     last_person: str | None = None
     last_person_duet = False
     for line in result.lines:
         aid = line.agent_id or Values.AgentDefault
         agent = agents.get(aid)
-        is_group = agent.type == Values.Group if agent else False
-        is_other = agent.type == Values.Other if agent else False
+        agent_type = agent.type if agent else None
 
         current_duet = False
-        if is_group:
-            current_duet = False
-        elif last_person is None:
-            current_duet = is_other
-            last_person = aid
-            last_person_duet = current_duet
-        elif last_person == aid:
-            current_duet = last_person_duet
-        else:
-            current_duet = not last_person_duet
-            last_person = aid
-            last_person_duet = current_duet
+        if agent_type != Values.Group:
+            if last_person is None:
+                current_duet = last_person_duet = agent_type == Values.Other
+                last_person = aid
+            elif last_person != aid:
+                current_duet = last_person_duet = not last_person_duet
+                last_person = aid
+            else:
+                current_duet = last_person_duet
 
         lines.append(convert(line, False, current_duet))
         if line.background_vocal:
             lines.append(convert(line.background_vocal, True, current_duet))
 
-    metadata: list[MetadataEntry] = []
     meta = result.metadata
-    if meta.title:
-        metadata.append(MetadataEntry(Values.MusicName, list(meta.title)))
-    if meta.artist:
-        metadata.append(MetadataEntry(Values.Artists, list(meta.artist)))
-    if meta.album:
-        metadata.append(MetadataEntry(Values.Album, list(meta.album)))
-    if meta.isrc:
-        metadata.append(MetadataEntry(Values.ISRC, list(meta.isrc)))
-    if meta.author_ids:
-        metadata.append(MetadataEntry(Values.TTMLAuthorGithub, list(meta.author_ids)))
-    if meta.author_names:
-        metadata.append(MetadataEntry(Values.TTMLAuthorGithubLogin, list(meta.author_names)))
-    if meta.language:
-        metadata.append(MetadataEntry(Values.Language, [meta.language]))
-    if meta.timing_mode:
-        metadata.append(MetadataEntry(Values.TimingMode, [meta.timing_mode]))
-    if meta.songwriters:
-        metadata.append(MetadataEntry("songwriters", list(meta.songwriters)))
-    for key in ("ncmMusicId", "qqMusicId", "spotifyId", "appleMusicId"):
-        if meta.platform_ids.get(key):
-            metadata.append(MetadataEntry(key, list(meta.platform_ids[key])))
-    for k, v in meta.raw_properties.items():
-        metadata.append(MetadataEntry(k, list(v)))
+    metadata = [
+        MetadataEntry(key, list(values))
+        for key, values in (
+            (Values.MusicName, meta.title),
+            (Values.Artists, meta.artist),
+            (Values.Album, meta.album),
+            (Values.ISRC, meta.isrc),
+            (Values.TTMLAuthorGithub, meta.author_ids),
+            (Values.TTMLAuthorGithubLogin, meta.author_names),
+            (Values.Language, [meta.language] if meta.language else None),
+            (Values.TimingMode, [meta.timing_mode] if meta.timing_mode else None),
+            ("songwriters", meta.songwriters),
+            *(
+                (k, meta.platform_ids[k])
+                for k in ("ncmMusicId", "qqMusicId", "spotifyId", "appleMusicId")
+                if meta.platform_ids.get(k)
+            ),
+            *meta.raw_properties.items(),
+        )
+        if values
+    ]
 
-    return Lyric(lines=lines, metadata=metadata)
+    return Lyric(metadata=metadata, lines=lines)
 
 
 def _align_romanization(words: list[Word], roman_words: list[Word]) -> None:
@@ -1199,32 +1031,33 @@ def _align_romanization(words: list[Word], roman_words: list[Word]) -> None:
 
     先用精确时间快速匹配，失败则用区间 IoU 做最佳匹配。
     """
-    search_start = 0
     MIN_IOU = 0.1
     FAST_TOL = 2
+    search_start = 0
     for w in words:
+        w_start, w_end = w.start_time, w.end_time
         best_iou = 0.0
         best_idx = -1
         fast = False
-        j = search_start
-        while j < len(roman_words):
+        for j in range(search_start, len(roman_words)):
             sub = roman_words[j]
-            if abs(w.start_time - sub.start_time) <= FAST_TOL:
+            sub_start = sub.start_time
+            if abs(w_start - sub_start) <= FAST_TOL:
                 w.roman_word = sub.word
                 search_start = j + 1
                 fast = True
                 break
-            overlap_start = max(w.start_time, sub.start_time)
-            inter = max(0, min(w.end_time, sub.end_time) - overlap_start)
-            if inter > 0:
-                union_start = min(w.start_time, sub.start_time)
-                iou = inter / max(1, max(w.end_time, sub.end_time) - union_start)
+            overlap_start = max(w_start, sub_start)
+            overlap_end = min(w_end, sub.end_time)
+            if overlap_start < overlap_end:
+                union_start = min(w_start, sub_start)
+                union_end = max(w_end, sub.end_time)
+                iou = (overlap_end - overlap_start) / max(1, union_end - union_start)
                 if iou > best_iou:
                     best_iou = iou
                     best_idx = j
-            if sub.start_time >= w.end_time:
+            if sub_start >= w_end:
                 break
-            j += 1
         if not fast and best_idx != -1 and best_iou >= MIN_IOU:
             w.roman_word = roman_words[best_idx].word
             search_start = best_idx + 1
@@ -1243,8 +1076,8 @@ def _to_ttml_result(lyric: Lyric, options: ParserOptions | dict | None = None) -
     opts = ParserOptions.from_dict(options or {"translation_language": "zh-Hans"})
 
     metadata = _TTMLMetadata()
-    metadata.agents[Values.AgentDefault] = _TTMLAgent(id=Values.AgentDefault, type=Values.Person)
-    metadata.agents[Values.AgentDefaultDuet] = _TTMLAgent(id=Values.AgentDefaultDuet, type=Values.Person)
+    for aid in (Values.AgentDefault, Values.AgentDefaultDuet):
+        metadata.agents[aid] = _TTMLAgent(id=aid, type=Values.Person)
 
     for entry in lyric.metadata:
         if not entry.values:
@@ -1278,38 +1111,38 @@ def _to_ttml_result(lyric: Lyric, options: ParserOptions | dict | None = None) -
 
     for line in lyric.lines:
         main_words, roman_words, full_text, roman_text = _convert_words(line)
-        trans_content: list[_TTMLSubContent] | None = None
-        if line.translated_lyric:
-            trans_content = [_TTMLSubContent(text=line.translated_lyric, language=opts.translation_language)]
-        roman_content: list[_TTMLSubContent] | None = None
-        if line.roman_lyric or roman_words:
-            roman_content = [
-                _TTMLSubContent(
-                    text=line.roman_lyric or roman_text,
-                    language=opts.romanization_language,
-                    words=roman_words if roman_words else None,
-                )
-            ]
-
         ttml_line = _TTMLLine(
             start_time=line.start_time,
             end_time=line.end_time,
             text=full_text,
             words=main_words,
-            translations=trans_content,
-            romanizations=roman_content,
+            translations=(
+                [_TTMLSubContent(text=line.translated_lyric, language=opts.translation_language)]
+                if line.translated_lyric
+                else None
+            ),
+            romanizations=(
+                [
+                    _TTMLSubContent(
+                        text=line.roman_lyric or roman_text,
+                        language=opts.romanization_language,
+                        words=roman_words or None,
+                    )
+                ]
+                if (line.roman_lyric or roman_words)
+                else None
+            ),
         )
 
         if line.is_bg:
             if current_main is not None and not current_main.background_vocal:
                 current_main.background_vocal = ttml_line
-            else:
-                ttml_line.agent_id = current_main.agent_id if current_main else Values.AgentDefault
-                result_lines.append(ttml_line)
+                continue
+            ttml_line.agent_id = current_main.agent_id if current_main else Values.AgentDefault
         else:
             ttml_line.agent_id = Values.AgentDefaultDuet if line.is_duet else Values.AgentDefault
-            result_lines.append(ttml_line)
             current_main = ttml_line
+        result_lines.append(ttml_line)
 
     return _TTMLResult(metadata=metadata, lines=result_lines)
 
@@ -1323,23 +1156,20 @@ def _convert_words(line: Line) -> tuple[list[Word], list[Word], str, str]:
     main_words: list[Word] = []
     roman_words: list[Word] = []
     for w in line.words:
-        raw = w.word
-        trimmed = raw.rstrip()
-        has_space = raw != trimmed
-        syl = Word(
-            word=trimmed + (" " if has_space else ""),
-            start_time=w.start_time,
-            end_time=w.end_time,
-            obscene=w.obscene,
-            empty_beat=w.empty_beat,
-            ruby=w.ruby,
+        trimmed = w.word.rstrip()
+        main_words.append(
+            Word(
+                word=trimmed + (" " if w.word != trimmed else ""),
+                start_time=w.start_time,
+                end_time=w.end_time,
+                obscene=w.obscene,
+                empty_beat=w.empty_beat,
+                ruby=w.ruby,
+            )
         )
-        main_words.append(syl)
         if w.roman_word:
             roman_words.append(Word(word=w.roman_word.strip(), start_time=w.start_time, end_time=w.end_time))
-    full_text = "".join(w.word for w in line.words)
-    roman_text = "".join(s.word for s in roman_words) if roman_words else ""
-    return main_words, roman_words, full_text, roman_text
+    return (main_words, roman_words, "".join(w.word for w in line.words), "".join(s.word for s in roman_words))
 
 
 # ============================== 公共 API ==============================

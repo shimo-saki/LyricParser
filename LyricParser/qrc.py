@@ -27,17 +27,12 @@ def parse_qrc(qrc: str) -> list[Line]:
         行列表。
     """
     out: list[Line] = []
-    for raw in re.split(r"\r?\n", qrc):
-        line_str = raw.strip()
-        if not line_str:
+    for line_str in map(str.strip, re.split(r"\r?\n", qrc)):
+        if not line_str or not (m := LINE_REGEX.match(line_str)):
             continue
-        m = LINE_REGEX.match(line_str)
-        if not m:
+        if not (content := line_str[m.end() :].strip()):
             continue
-        line_start, line_dur = int(m.group(1)), int(m.group(2))
-        content = line_str[m.end() :].strip()
-        if not content:
-            continue
+        line_start, line_dur = map(int, m.group(1, 2))
         words: list[Word] = []
         for wm in WORD_REGEX.finditer(content):
             text, ws, wd = wm.group(1), int(wm.group(2)), int(wm.group(3))
@@ -46,14 +41,7 @@ def parse_qrc(qrc: str) -> list[Line]:
         if is_bg:
             words[0].word = re.sub(r"^[(（]", "", words[0].word)
             words[-1].word = re.sub(r"[）)]$", "", words[-1].word)
-        out.append(
-            Line(
-                start_time=line_start,
-                end_time=line_start + line_dur,
-                words=words,
-                is_bg=is_bg,
-            )
-        )
+        out.append(Line(start_time=line_start, end_time=line_start + line_dur, words=words, is_bg=is_bg))
     return out
 
 
@@ -74,8 +62,8 @@ def stringify_qrc(lines: list[Line]) -> str:
     out: list[str] = []
     for line in lines:
         ls, le = int(line.start_time), int(line.end_time)
-        ld = le - ls
         buf: list[str] = []
+        last = len(line.words) - 1
         for idx, w in enumerate(line.words):
             if not w.word.strip() and buf:
                 # 无意义的空音节合并到前一格
@@ -87,9 +75,9 @@ def stringify_qrc(lines: list[Line]) -> str:
             if line.is_bg:
                 if idx == 0:
                     printed = f"（{printed}"
-                if idx == len(line.words) - 1:
+                if idx == last:
                     printed += "）"
             ws, we = int(w.start_time), int(w.end_time)
             buf.append(f"{printed}({ws},{we - ws})")
-        out.append(f"[{ls},{ld}]{''.join(buf)}")
+        out.append(f"[{ls},{le - ls}]{''.join(buf)}")
     return "\n".join(out)

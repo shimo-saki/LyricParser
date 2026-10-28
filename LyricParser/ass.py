@@ -15,15 +15,12 @@ def _speaker(line: Line) -> str:
     - 对唱：``v2``
     - 背景人声：后缀 ``-bg``
     """
-    name = "v2" if line.is_duet else "v1"
-    return name + ("-bg" if line.is_bg else "")
+    return ("v2" if line.is_duet else "v1") + ("-bg" if line.is_bg else "")
 
 
 def _dialog(out: list[str], start: float, end: float, name: str, text: str) -> None:
     """向输出列表追加一条 Dialogue 行。"""
-    out.append(
-        f"Dialogue: 0,{write_ass_timestamp(start)}, " f"{write_ass_timestamp(end)}, Default, {name},0,0,0,,{text}"
-    )
+    out.append(f"Dialogue: 0,{write_ass_timestamp(start)}, {write_ass_timestamp(end)}, Default, {name},0,0,0,,{text}")
 
 
 def stringify_ass(lines: list[Line]) -> str:

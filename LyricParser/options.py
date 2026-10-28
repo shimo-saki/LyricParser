@@ -30,17 +30,20 @@ class ParserOptions:
     mode: Literal["plain", "enhanced"] = "enhanced"
     translation_language: str | None = None
     romanization_language: str | None = None
+    parse_comments: bool = False
 
     def __post_init__(self) -> None:
         if self.mode not in ("plain", "enhanced"):
-            raise ValueError(f"mode 必须是 'plain' / 'enhanced' / 'spl'，" f"实际为 {self.mode!r}")
+            raise ValueError(f"mode 必须是 'plain' 或 'enhanced'，实际为 {self.mode!r}")
         for name in ("translation_language", "romanization_language"):
             value = getattr(self, name)
-            if value is not None and not isinstance(value, str):
-                raise TypeError(f"{name} 必须是 str 或 None，" f"实际为 {type(value).__name__!r}")
+            if not isinstance(value, (str, type(None))):
+                raise TypeError(f"{name} 必须是 str 或 None，实际为 {type(value).__name__!r}")
+        if not isinstance(self.parse_comments, bool):
+            raise TypeError(f"parse_comments 必须是 bool，实际为 {type(self.parse_comments).__name__!r}")
 
     @classmethod
-    def from_dict(cls, options: "ParserOptions | dict[str, Any] | None") -> "ParserOptions":
+    def from_dict(cls, options: "ParserOptions" | dict[str, Any] | None) -> "ParserOptions":
         """归一化构造：接受 ``ParserOptions`` / ``dict`` / ``None``。
 
         Raises:
@@ -53,7 +56,7 @@ class ParserOptions:
             return options
         if isinstance(options, dict):
             return cls(**options)
-        raise TypeError(f"options 必须是 ParserOptions / dict / None，" f"实际为 {type(options).__name__!r}")
+        raise TypeError(f"options 必须是 ParserOptions / dict / None，实际为 {type(options).__name__!r}")
 
 
 @dataclass
@@ -67,7 +70,6 @@ class StringifyOptions:
         mode: LRC 输出模式：
             - ``"plain"``：整行同步；
             - ``"enhanced"``：逐字，含 enhanced LRC 特性；
-            - ``"spl"``：SPL / Enhanced LRC 的逐字格式。
         inline_bracket: 逐字内联时间戳的括号：
             - ``"square"``：``[t]``（ESLRC 惯例）；
             - ``"angle"``：``<t>``（Enhanced LRC / SPL 惯例）。
@@ -82,7 +84,7 @@ class StringifyOptions:
     # Stringify 可选项
     ms_digits: Literal[1, 2, 3, 4, 5, 6] = 3
     include_metadata: bool = True
-    metadata_keys: frozenset[str] | None = None
+    metadata_keys: Iterable[str] | frozenset[str] | None = None
     use_sidecar: bool = False
 
     # Stringify 内部选项
@@ -91,27 +93,30 @@ class StringifyOptions:
 
     def __post_init__(self) -> None:
         if self.mode not in ("plain", "enhanced"):
-            raise ValueError(f"mode 必须是 'plain' 或 'enhanced'，" f"实际为 {self.mode!r}")
+            raise ValueError(f"mode 必须是 'plain' 或 'enhanced'，实际为 {self.mode!r}")
         if self.inline_bracket not in ("square", "angle"):
-            raise ValueError(f"inline_bracket 必须是 'square' 或 'angle'，" f"实际为 {self.inline_bracket!r}")
+            raise ValueError(f"inline_bracket 必须是 'square' 或 'angle'，实际为 {self.inline_bracket!r}")
         if not isinstance(self.ms_digits, int) or not 1 <= self.ms_digits <= 6:
             raise ValueError(f"ms_digits 必须是 1..6 的整数，实际为 {self.ms_digits!r}")
-        if not isinstance(self.include_metadata, bool):
-            raise TypeError(f"include_metadata 必须是 bool，" f"实际为 {type(self.include_metadata).__name__!r}")
-        if not isinstance(self.use_sidecar, bool):
-            raise TypeError(f"use_sidecar 必须是 bool，" f"实际为 {type(self.use_sidecar).__name__!r}")
+
+        for name in ("include_metadata", "use_sidecar"):
+            value = getattr(self, name)
+            if not isinstance(value, bool):
+                raise TypeError(f"{name} 必须是 bool，实际为 {type(value).__name__!r}")
+
         if self.metadata_keys is not None:
-            if isinstance(self.metadata_keys, str):
-                raise TypeError("metadata_keys 不能是字符串，必须传入字符串的可迭代对象" "（例如 {'ti', 'ar'}）")
-            if not isinstance(self.metadata_keys, Iterable):
-                raise TypeError(f"metadata_keys 必须是可迭代对象，" f"实际为 {type(self.metadata_keys).__name__!r}")
-            keys = frozenset(self.metadata_keys)
+            keys = self.metadata_keys
+            if isinstance(keys, str):
+                raise TypeError("metadata_keys 不能是字符串，必须传入字符串的可迭代对象（例如 {'ti', 'ar'}）")
+            if not isinstance(keys, Iterable):
+                raise TypeError(f"metadata_keys 必须是可迭代对象，实际为 {type(keys).__name__!r}")
+            keys = frozenset(keys)
             if not all(isinstance(k, str) for k in keys):
                 raise TypeError("metadata_keys 中的所有元素必须是字符串")
             self.metadata_keys = keys
 
     @classmethod
-    def from_dict(cls, options: StringifyOptions | dict[str, Any] | None) -> StringifyOptions:
+    def from_dict(cls, options: "StringifyOptions" | dict[str, Any] | None) -> "StringifyOptions":
         """归一化构造：接受 ``StringifyOptions`` / ``dict`` / ``None``。
 
         Raises:
@@ -124,4 +129,4 @@ class StringifyOptions:
             return options
         if isinstance(options, dict):
             return cls(**options)
-        raise TypeError(f"options 必须是 StringifyOptions / dict / None，" f"实际为 {type(options).__name__!r}")
+        raise TypeError(f"options 必须是 StringifyOptions / dict / None，实际为 {type(options).__name__!r}")

@@ -10,9 +10,8 @@
 
 import dataclasses
 import re
-from dataclasses import dataclass
 
-from .models import Line, Lyric, MetadataEntry, Word
+from .models import Line, Lyric, MetadataEntry, Word, _LineFeatures, _Token
 from .options import ParserOptions, StringifyOptions
 from .utils import (
     MAX_LRC_TIMESTAMP,
@@ -20,48 +19,21 @@ from .utils import (
     format_time,
     is_word_sync_lyric,
     normalize_timestamp,
-    parse_timestamp_parts,
+    parse_timestamp,
 )
 
 # 行内逐字时间戳（同时支持 [] 和 <>）
-WORD_TIMESTAMP_REGEX = re.compile(r"(?:\[|<)(?P<min>\d{1,3}):(?P<sec>\d{1,2})(?:[:.](?P<ms>\d{1,6}))?(?:\]|>)")
+WORD_TIMESTAMP_REGEX = re.compile(r"((?:\[|<)\d{1,3}:\d{1,2}(?:[:.]\d{1,6})?(?:\]|>))")
 # 元数据行：[key:value]
 METADATA_REGEX = re.compile(r"^\[\s*(?P<key>[a-zA-Z]+)\s*:\s*(?P<value>.*?)\s*\]$")
-# 注释前缀
-COMMENT_PREFIXES: list[str] = ["#", "//"]
 # 背景人声判定：全角/半角括号
 BG_PAREN_BEGIN = re.compile(r"^[(（]")
 BG_PAREN_END = re.compile(r"[）)]$")
+# 注释前缀
+COMMENT_PREFIXES: tuple[str, ...] = ("#", "//")
+
 
 # ============================== 解析 ==============================
-
-
-@dataclass
-class _Token:
-    """词法单元：文本片段或时间戳。
-
-    Attributes:
-        type: ``"text"`` 或 ``"time"``。
-        val: 文本内容（str）或毫秒时间（int）。
-    """
-
-    type: str
-    val: str | int
-
-
-@dataclass
-class _LineFeatures:
-    """一行歌词在词法分析后的特性。
-
-    Attributes:
-        first_text_index: 首个文本 token 的下标；-1 表示无文本。
-        is_word_sync: 是否含内联时间戳（即 ``<t>...`` 或 ``[t]...`` 形式）。
-        text: 整行拼接后的纯文本（已去除时间戳）。
-    """
-
-    first_text_index: int
-    is_word_sync: bool
-    text: str
 
 
 def _parse_metadata_line(line: str) -> list[MetadataEntry] | None:
@@ -73,14 +45,12 @@ def _parse_metadata_line(line: str) -> list[MetadataEntry] | None:
     Returns:
         成功时返回仅含一条 :class:`MetadataEntry` 的列表，失败返回 None。
     """
-    m = METADATA_REGEX.match(line)
-    if not m:
+    if not (m := METADATA_REGEX.match(line)):
         return None
-    key = m.group("key").lower()
     value = m.group("value").strip()
     if not value:
         return None
-    return [MetadataEntry(key=key, values=[value])]
+    return [MetadataEntry(key=m.group("key").lower(), values=[value])]
 
 
 def _merge_metadata(target: list[MetadataEntry], source: list[MetadataEntry]) -> None:
@@ -88,9 +58,7 @@ def _merge_metadata(target: list[MetadataEntry], source: list[MetadataEntry]) ->
     for entry in source:
         for existing in target:
             if existing.key == entry.key:
-                for v in entry.values:
-                    if v not in existing.values:
-                        existing.values.append(v)
+                existing.values.extend(v for v in entry.values if v not in existing.values)
                 break
         else:
             target.append(MetadataEntry(key=entry.key, values=list(entry.values)))
@@ -112,12 +80,10 @@ def _strip_parens(words: list[Word]) -> None:
     """
     if not words:
         return
-    first = words[0].word
-    if first and first[0] in "(（":
-        words[0].word = first[1:]
-    last = words[-1].word
-    if last and last[-1] in ")）":
-        words[-1].word = last[:-1]
+    if words[0].word[:1] in ("(", "（"):
+        words[0].word = words[0].word[1:]
+    if words[-1].word[-1:] in (")", "）"):
+        words[-1].word = words[-1].word[:-1]
     words[:] = [w for w in words if w.word]
 
 
@@ -131,6 +97,7 @@ class LrcParser:
     def __init__(self, options: ParserOptions | dict | None = None) -> None:
         self.options: ParserOptions = ParserOptions.from_dict(options)
         self.mode: str = self.options.mode
+        self.parse_comments: bool = self.options.parse_comments
 
     @property
     def _word_level(self) -> bool:
@@ -151,42 +118,47 @@ class LrcParser:
         """
 
         # 纯文本检测：任意位置都没有时间戳 → 直接走纯文本路径
-        if WORD_TIMESTAMP_REGEX.search(text) is None:
+        if not WORD_TIMESTAMP_REGEX.search(text):
             return self._parse_plain_text(text)
 
         metadata: list[MetadataEntry] = []
-        all_lines: list[Line] = []
+        lines: list[Line] = []
 
         for raw in re.split(r"\r?\n", text):
             line = raw.strip()
             if not line:
                 continue
-            if any(line.startswith(p) for p in COMMENT_PREFIXES):
-                continue
 
-            parsed_meta = _parse_metadata_line(line)
-            if parsed_meta:
+            if parsed_meta := _parse_metadata_line(line):
                 _merge_metadata(metadata, parsed_meta)
                 continue
 
-            tokens = self._tokenize(line)
-            if not tokens:
+            if not (tokens := self._tokenize(line)):
                 continue
 
+            if is_comment := tokens[0].type == "comment":
+                if not self.parse_comments:
+                    continue
+                if not (tokens := tokens[1:]):
+                    continue
+
             feats = self._line_features(tokens)
-            if feats.text.strip() == "":
+            if not feats.text.strip():
                 # 显式结束时间行（`[00:05.00]` 空内容）
-                self._append_explicit_end_time(tokens, all_lines)
+                self._append_explicit_end_time(tokens, lines)
                 continue
 
             new_lines = self._parse_word_sync(tokens, feats) if feats.is_word_sync else self._parse_plain(tokens, feats)
-            all_lines.extend(new_lines)
+            if is_comment:
+                for nl in new_lines:
+                    nl.is_comment = True
+            lines.extend(new_lines)
 
         # 后处理：按 start_time 分组绑定翻译 + 判定 bg
-        all_lines = self._bind_translations_and_bg(all_lines)
-        all_lines = self._finalize(all_lines)
+        lines = self._bind_translations_and_bg(lines)
+        lines = self._finalize(lines)
 
-        return Lyric(lines=all_lines, metadata=metadata)
+        return Lyric(metadata=metadata, lines=lines)
 
     def _parse_plain_text(self, text: str) -> Lyric:
         """解析无时间戳的纯文本歌词。
@@ -206,57 +178,47 @@ class LrcParser:
         metadata: list[MetadataEntry] = []
         lines: list[Line] = []
 
-        for raw in re.split(r"\r?\n", text):
-            line = raw.strip()
-            if not line:
-                continue
-            if any(line.startswith(p) for p in COMMENT_PREFIXES):
+        for line in map(str.strip, re.split(r"\r?\n", text)):
+            if not line or line.startswith(COMMENT_PREFIXES):
                 continue
 
-            parsed_meta = _parse_metadata_line(line)
-            if parsed_meta:
+            if parsed_meta := _parse_metadata_line(line):
                 _merge_metadata(metadata, parsed_meta)
                 continue
 
-            lines.append(Line(start_time=None, end_time=None, words=[Word(word=line, start_time=None, end_time=None)]))
+            lines.append(Line(words=[Word(word=line)]))
 
-        return Lyric(lines=lines, metadata=metadata)
+        return Lyric(metadata=metadata, lines=lines)
 
     def _tokenize(self, line: str) -> list[_Token]:
         """将一行文本拆分为文本/时间 token 序列。"""
         tokens: list[_Token] = []
-        last = 0
-        for m in WORD_TIMESTAMP_REGEX.finditer(line):
-            before = line[last : m.start()]
-            if before:
-                tokens.append(_Token(type="text", val=before))
-            t = parse_timestamp_parts(m.group("min"), m.group("sec"), m.group("ms") or "")
-            tokens.append(_Token(type="time", val=t))
-            last = m.end()
-        rest = line[last:]
-        if rest:
-            tokens.append(_Token(type="text", val=rest))
+        for prefix in COMMENT_PREFIXES:
+            if line.startswith(prefix):
+                tokens.append(_Token(type="comment", val=prefix))
+                line = line.removeprefix(prefix).lstrip()
+                break
+        tokens.extend(
+            _Token(type="time", val=parse_timestamp(part)) if part[0] in "[<" else _Token(type="text", val=part)
+            for part in WORD_TIMESTAMP_REGEX.split(line)
+            if part
+        )
         return tokens
 
     def _line_features(self, tokens: list[_Token]) -> _LineFeatures:
         """分析 token 序列的整行特性。"""
         first_text = next((i for i, t in enumerate(tokens) if t.type == "text"), -1)
-        is_word_sync = False
-        if first_text > 0:
-            for i in range(first_text + 1, len(tokens)):
-                if tokens[i].type == "time":
-                    is_word_sync = True
-                    break
-        text = "".join(str(t.val) for t in tokens if t.type == "text")
+        is_word_sync = first_text > 0 and any(t.type == "time" for t in tokens[first_text + 1 :])
+        text = "".join(t.val for t in tokens if t.type == "text")
         return _LineFeatures(first_text_index=first_text, is_word_sync=is_word_sync, text=text)
 
-    def _append_explicit_end_time(self, tokens: list[_Token], all_lines: list[Line]) -> None:
+    def _append_explicit_end_time(self, tokens: list[_Token], lines: list[Line]) -> None:
         """处理"只含时间戳"的行，作为上一行的显式结束时间。"""
-        last_time = next((int(t.val) for t in reversed(tokens) if t.type == "time"), None)
-        last_line = all_lines[-1] if all_lines else None
-        if last_time is None or last_line is None:
+        if not lines:
             return
-        if last_line.end_time != -1 or last_time <= last_line.start_time:
+        last_time = next((t.val for t in reversed(tokens) if t.type == "time"), None)
+        last_line = lines[-1]
+        if last_time is None or last_line.end_time != -1 or last_time <= last_line.start_time:
             return
         last_line.end_time = last_time
 
@@ -273,18 +235,10 @@ class LrcParser:
         Returns:
             每行一个 ``Line``（多时间戳时一行展开为多条）。
         """
-        base_times: list[int] = []
         end = feats.first_text_index if feats.first_text_index != -1 else len(tokens)
-        for i in range(end):
-            tk = tokens[i]
-            if tk.type == "time" and int(tk.val) not in base_times:
-                base_times.append(int(tk.val))
+        base_times = list(dict.fromkeys(t.val for t in tokens[:end] if t.type == "time"))
         return [
-            Line(
-                start_time=t,
-                end_time=-1,
-                words=[Word(word=feats.text, start_time=t, end_time=-1)],
-            )
+            Line(start_time=t, end_time=-1, words=[Word(word=feats.text, start_time=t, end_time=-1)])
             for t in base_times
         ]
 
@@ -310,7 +264,8 @@ class LrcParser:
         syllable_start = int(tokens[feats.first_text_index - 1].val)
         syllables: list[Word] = []
         current_text = ""
-        explicit_end: int | None = None
+        explicit_end = -1
+        last = len(tokens) - 1
         for i in range(feats.first_text_index, len(tokens)):
             tk = tokens[i]
             if tk.type == "text":
@@ -321,43 +276,40 @@ class LrcParser:
                     syllables.append(Word(word=current_text, start_time=syllable_start, end_time=nt))
                     current_text = ""
                 syllable_start = nt
-                if i == len(tokens) - 1:
+                if i == last:
                     explicit_end = nt
         if current_text:
             syllables.append(Word(word=current_text, start_time=syllable_start, end_time=-1))
 
-        end_time = explicit_end if explicit_end is not None else -1
-        if is_word_sync_lyric(syllables, base_time):
-            return [Line(start_time=base_time, end_time=end_time, words=syllables)]
-        return [
-            Line(
-                start_time=base_time,
-                end_time=end_time,
-                words=[Word(word=feats.text, start_time=base_time, end_time=-1)],
-            )
-        ]
+        words = (
+            syllables
+            if is_word_sync_lyric(syllables, base_time)
+            else [Word(word=feats.text, start_time=base_time, end_time=-1)]
+        )
+        return [Line(start_time=base_time, end_time=explicit_end, words=words)]
 
-    def _finalize(self, all_lines: list[Line]) -> list[Line]:
+    def _finalize(self, lines: list[Line]) -> list[Line]:
         """按时间排序、补全结束时间，并根据模式决定是否剥离逐字。"""
-        all_lines.sort(key=lambda l: l.start_time)
-        self._resolve_end_times(all_lines)
+        lines.sort(key=lambda l: l.start_time)
+        self._resolve_end_times(lines)
         if not self._word_level:
-            self._strip_word_timings(all_lines)
-        return all_lines
+            self._strip_word_timings(lines)
+        return lines
 
-    def _resolve_end_times(self, all_lines: list[Line]) -> None:
+    def _resolve_end_times(self, lines: list[Line]) -> None:
         """为所有 ``end_time == -1`` 的行/音节推导结束时间。
 
         规则：非末行取下一行开始时间；末行（整行同步）取
         ``MAX_LRC_TIMESTAMP``；末行（逐字）最后一个音节补 1 秒。
         """
-        for i, line in enumerate(all_lines):
-            is_last = i == len(all_lines) - 1
+        last = len(lines) - 1
+        for i, line in enumerate(lines):
+            is_last = i == last
             if line.end_time == -1:
-                if is_last and not is_word_sync_lyric(line.words, line.start_time):
+                if not is_last:
+                    line.end_time = lines[i + 1].start_time
+                elif not is_word_sync_lyric(line.words, line.start_time):
                     line.end_time = MAX_LRC_TIMESTAMP
-                elif not is_last:
-                    line.end_time = all_lines[i + 1].start_time
             for j, w in enumerate(line.words):
                 if w.end_time != -1:
                     continue
@@ -369,14 +321,13 @@ class LrcParser:
                 else:
                     w.end_time = line.end_time
 
-    def _strip_word_timings(self, all_lines: list[Line]) -> None:
+    def _strip_word_timings(self, lines: list[Line]) -> None:
         """在 plain 模式下丢弃逐字，仅保留整行单音节。"""
-        for line in all_lines:
-            if len(line.words) <= 1:
-                continue
-            line.words = [Word(line.text, line.start_time, line.end_time)]
+        for line in lines:
+            if len(line.words) > 1:
+                line.words = [Word(line.text, line.start_time, line.end_time)]
 
-    def _bind_translations_and_bg(self, all_lines: list[Line]) -> list[Line]:
+    def _bind_translations_and_bg(self, lines: list[Line]) -> list[Line]:
         """按 ``start_time`` 分组绑定翻译并判定 bg 行。
 
         分组规则：
@@ -388,23 +339,17 @@ class LrcParser:
         - 翻译行整行被括号包裹时 → 剥除括号后作为翻译文本
 
         Args:
-            all_lines: 解析阶段产生的全部行（含翻译行）。
+            lines: 解析阶段产生的全部行（含翻译行）。
 
         Returns:
             过滤后的行列表（翻译行已并入 ``translated_lyric``，不再独立存在）。
         """
         groups: dict[int, list[Line]] = {}
-        order: list[int] = []
-        for line in all_lines:
-            t = int(line.start_time)
-            if t not in groups:
-                groups[t] = []
-                order.append(t)
-            groups[t].append(line)
+        for line in lines:
+            groups.setdefault(int(line.start_time), []).append(line)
 
         result: list[Line] = []
-        for t in order:
-            group = groups[t]
+        for group in groups.values():
             main_line = group[0]
 
             if _is_bg_text(main_line.text):
@@ -462,8 +407,7 @@ class LrcGenerator:
         """
         return self.inline_bracket == "square"
 
-    @staticmethod
-    def _is_metadata_visible(entry: MetadataEntry) -> bool:
+    def _is_metadata_visible(self, entry: MetadataEntry) -> bool:
         """判断一条元数据是否应输出。
 
         过滤规则：
@@ -471,15 +415,15 @@ class LrcGenerator:
         - 键为空
         - 所有值都为空白
         - ``offset`` 键且所有值为 ``0``（视为无意义）
+        - 键不在白名单 metadata_keys 中
         """
-        if not entry.key.strip():
+
+        if not entry.key.strip() or not (vals := [s for s in map(str.strip, entry.values) if s]):
             return False
-        vals = [v for v in entry.values if v.strip()]
-        if not vals:
-            return False
-        if entry.key.lower() == "offset" and all(v.strip() == "0" for v in vals):
-            return False
-        return True
+        key = entry.key.lower()
+        return (self.metadata_keys is None or key in self.metadata_keys) and not (
+            key == "offset" and all(v == "0" for v in vals)
+        )
 
     @staticmethod
     def _wrap_bg_text(text: str) -> str:
@@ -495,9 +439,7 @@ class LrcGenerator:
             已包裹半角括号的文本；空字符串原样返回。
         """
         s = text.strip()
-        if not s:
-            return s
-        if s.startswith(("(", "（")) and s.endswith((")", "）")):
+        if not s or (s.startswith(("(", "（")) and s.endswith((")", "）"))):
             return s
         return f"({s})"
 
@@ -517,55 +459,40 @@ class LrcGenerator:
         Returns:
             序列化后的文本。
         """
-        if isinstance(source, Lyric):
-            metadata = source.metadata
-            source_lines = source.lines
-        else:
-            metadata = []
-            source_lines = source
+        metadata, source_lines = (source.metadata, source.lines) if isinstance(source, Lyric) else ([], source)
 
         # 元数据
         meta_lines: list[str] = []
         if self.include_metadata:
-            for entry in metadata:
-                if self.metadata_keys is not None and entry.key.lower() not in self.metadata_keys:
-                    continue
-                if not self._is_metadata_visible(entry):
-                    continue
-                vals = [v for v in entry.values if v.strip()]
-                meta_lines.append(f"[{entry.key}:{'/'.join(vals)}]")
-
-        # 全纯文本快速路径
-        if source_lines and all(l.start_time is None for l in source_lines):
-            lyric_lines: list[str] = [text for line in source_lines if (text := line.text).strip()]
-            return self._join_output(meta_lines, lyric_lines)
-
-        # 同步 / 混合：每行独立输出
-        normalized = [self._normalize(l) for l in source_lines if l.text.strip()]
+            meta_lines = [
+                f"[{entry.key}:{'/'.join(vals)}]"
+                for entry in metadata
+                if self._is_metadata_visible(entry) and (vals := [v for v in entry.values if v.strip()])
+            ]
 
         lyric_lines: list[str] = []
-        for line in normalized:
-            self._process_line(line, lyric_lines)
+        if all(l.start_time is None for l in source_lines):
+            # 全纯文本快速路径
+            lyric_lines = [line.text for line in source_lines if line.text.strip()]
+        else:
+            # 同步 / 混合：每行独立输出
+            for line in source_lines:
+                if line.text.strip():
+                    self._process_line(self._normalize(line), lyric_lines)
 
         return self._join_output(meta_lines, lyric_lines)
 
     @staticmethod
     def _join_output(meta_lines: list[str], lyric_lines: list[str]) -> str:
         """拼接元数据与歌词行（元数据与歌词间空一行）。"""
-        if meta_lines and lyric_lines:
-            return "\n".join(meta_lines) + "\n\n" + "\n".join(lyric_lines)
-        if meta_lines:
-            return "\n".join(meta_lines)
-        return "\n".join(lyric_lines)
+        return "\n\n".join(s for s in ("\n".join(meta_lines), "\n".join(lyric_lines)) if s)
 
     @staticmethod
     def _normalize(line: Line) -> Line:
         """归一化行内所有时间字段。"""
-        line.start_time = normalize_timestamp(line.start_time)  # type: ignore
-        line.end_time = normalize_timestamp(line.end_time)  # type: ignore
-        for w in line.words:
-            w.start_time = normalize_timestamp(w.start_time)  # type: ignore
-            w.end_time = normalize_timestamp(w.end_time)  # type: ignore
+        for obj in (line, *line.words):
+            obj.start_time = normalize_timestamp(obj.start_time)
+            obj.end_time = normalize_timestamp(obj.end_time)
         return line
 
     def _process_line(self, line: Line, out: list[str]) -> None:
@@ -581,20 +508,16 @@ class LrcGenerator:
             line: 待输出的歌词行。
             out: 输出行列表（就地追加）。
         """
-        # 纯文本行：直接输出文本，无时间戳
         if line.start_time is None:
-            text = line.text
-            if not text.strip():
+            # 纯文本行：直接输出文本，无时间戳
+            if not line.text.strip():
                 return
-            if line.is_bg:
-                text = f"({text})"
-            out.append(text)
-            self._append_aux_lines(line, None, out)
-            return
-
-        # 有时间戳的行
-        line_time = self._tag(line.start_time, "square")
-        out.append(self._render_base(line, line.text, line.is_bg))
+            out.append(f"({line.text})" if line.is_bg else line.text)
+            line_time = None
+        else:
+            # 有时间戳的行
+            line_time = self._tag(line.start_time, "square")
+            out.append(self._render_base(line, line.text, line.is_bg))
         self._append_aux_lines(line, line_time, out)
 
     def _append_aux_lines(self, line: Line, line_time: str | None, out: list[str]) -> None:
@@ -606,18 +529,12 @@ class LrcGenerator:
             out: 输出行列表（就地追加）。
         """
         prefix = line_time or ""
-        if line.translated_lyric:
-            for sub in line.translated_lyric.split("\n"):
-                if not sub:
-                    continue
-                text = self._wrap_bg_text(sub) if line.is_bg else sub
-                out.append(f"{prefix}{text}")
-        if line.roman_lyric:
-            for sub in line.roman_lyric.split("\n"):
-                if not sub:
-                    continue
-                text = self._wrap_bg_text(sub) if line.is_bg else sub
-                out.append(f"{prefix}{text}")
+        out.extend(
+            prefix + (self._wrap_bg_text(sub) if line.is_bg else sub)
+            for aux in (line.translated_lyric, line.roman_lyric)
+            for sub in (aux or "").split("\n")
+            if sub
+        )
 
     def _render_base(self, item: Line, line_text: str, is_bgv: bool) -> str:
         """渲染一行主体（不含翻译/罗马字辅助行）。
@@ -640,25 +557,24 @@ class LrcGenerator:
         # 过滤因剥括号而变空的音节，避免 "(" 成为独立符号
         words = [w for w in item.words if w.word] or item.words
 
-        if self._word_level and words:
-            lead = words[0].start_time if self.uses_first_word_start else item.start_time
-            buf = self._tag(lead, "square")
-            for i, w in enumerate(words):
-                if i > 0 or not self.uses_first_word_start:
-                    buf += self._tag(w.start_time, self.inline_bracket)
-                text = w.word
-                if is_bgv:
-                    if i == 0:
-                        text = f"({text}"
-                    if i == len(words) - 1:
-                        text = f"{text})"
-                buf += text
-                if i == len(words) - 1:
-                    buf += self._tag(w.end_time, self.inline_bracket)
-            return buf
+        if not (self._word_level and words):
+            return f"{self._tag(item.start_time, 'square')}{f"({line_text})" if is_bgv else line_text}"
 
-        result = f"{self._tag(item.start_time, 'square')}{'(' + line_text + ')' if is_bgv else line_text}"
-        return result
+        lead = words[0].start_time if self.uses_first_word_start else item.start_time
+        buf = self._tag(lead, "square")
+        last = len(words) - 1
+        for i, w in enumerate(words):
+            if i > 0 or not self.uses_first_word_start:
+                buf += self._tag(w.start_time, self.inline_bracket)
+            text = w.word
+            if is_bgv and i == 0:
+                text = f"({text}"
+            if is_bgv and i == last:
+                text = f"{text})"
+            buf += text
+            if i == last:
+                buf += self._tag(w.end_time, self.inline_bracket)
+        return buf
 
     def _tag(self, ms: int, bracket: str = "square") -> str:
         """将毫秒渲染为时间戳字符串。

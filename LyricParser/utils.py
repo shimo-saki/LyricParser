@@ -32,7 +32,7 @@ def _validate_ms_digits(n: int) -> int:
     Raises:
         ValueError: 当取值不是 1..6 的整数时。
     """
-    if not isinstance(n, int) or n < 1 or n > 6:
+    if not (isinstance(n, int) and 1 <= n <= 6):
         raise ValueError(f"ms_digits 必须是 1..6 的整数，实际为 {n!r}")
     return n
 
@@ -63,7 +63,7 @@ def normalize_timestamp(ms: int | float | None) -> int | float | None:
     """将任意值归一化为合法的时间戳（毫秒）。
 
     ``None`` 原样返回 ``None``（表示"无时间戳"，纯文本歌词场景）；
-    NaN / 无穷大 / 无法解析 → 0；负数 → 0。
+    NaN / 无穷大 / 无法解析 / 负数 → 0。
     """
     if ms is None:
         return None
@@ -71,9 +71,7 @@ def normalize_timestamp(ms: int | float | None) -> int | float | None:
         v = float(ms)
     except (TypeError, ValueError):
         return 0
-    if math.isnan(v) or math.isinf(v):
-        return 0
-    return 0 if v < 0 else v
+    return v if math.isfinite(v) and v >= 0 else 0
 
 
 def _format_fraction(ms: int, ms_digits: int) -> str:
@@ -89,12 +87,10 @@ def _format_fraction(ms: int, ms_digits: int) -> str:
     Returns:
         指定位数的数字字符串。
     """
-    factor = 10 ** abs(ms_digits - 3)
-    value = ms // factor if ms_digits < 3 else ms * factor
-    return f"{value:0{ms_digits}d}"
+    return f"{ms * 10**ms_digits // 1000:0{ms_digits}d}"
 
 
-def normalize_duration(ms: int | float | None) -> Number:
+def normalize_duration(ms: Number | None) -> Number:
     """将任意值归一化为合法的时长（毫秒）。
 
     时长与时间戳语义相近，负数视为 0。
@@ -120,22 +116,39 @@ def clamp_timestamp(ms: Number) -> Number:
     return min(MAX_LRC_TIMESTAMP, normalize_timestamp(ms))
 
 
-def parse_timestamp_parts(min_str: str, sec_str: str, ms_str: str = "") -> int:
-    """将 ``分、秒、毫秒`` 三段字符串解析为毫秒时间戳。
+def parse_timestamp(timestamp: str) -> int:
+    """从时间戳字符串解析为毫秒。
 
-    毫秒段会自动补零或截断到 3 位；例如 ``"5"`` 被视为 500ms，
-    ``"12345"`` 被截断为 123ms。
+    支持以下形式（方括号 / 尖括号可省略）：
+
+    - ``"[mm:ss.xxx]"`` / ``"<mm:ss.xxx>"``：分:秒.毫秒（LRC 标准）
+    - ``"[mm:ss:xxx]"``：分:秒:毫秒（冒号作毫秒分隔）
+    - ``"[mm:ss]"``：分:秒（无毫秒）
+    - ``"[ss.xxx]"``：纯秒.毫秒
+    - ``"mm:ss.xxx"`` / ``"mm:ss"`` 等不带括号形式
+
+    毫秒段按 ``(ms + "000")[:3]`` 补齐到 3 位（与 LRC 惯例一致）：
+    ``"5"`` → 500ms，``"23"`` → 230ms，``"023"`` → 23ms，``""`` → 0ms。
 
     Args:
-        min_str: 分钟字符串。
-        sec_str: 秒字符串。
-        ms_str: 毫秒字符串，可为空。
+        timestamp: 时间戳字符串。
 
     Returns:
         毫秒时间戳。
+
+    Raises:
+        ValueError: 段数超过 3 时。
     """
-    ms_padded = (ms_str + "000")[:3]
-    return int(min_str) * 60000 + int(sec_str) * 1000 + int(ms_padded)
+    timestamp = timestamp.strip("[]<>")
+    if ":" not in timestamp:
+        return round(float(timestamp) * 1000)
+
+    parts = timestamp.replace(".", ":").split(":")
+    if len(parts) > 3:
+        raise ValueError(f"无法解析时间戳：{timestamp!r}")
+    mm, ss, ms = parts + ["0"] * (3 - len(parts))
+
+    return int(mm) * 60000 + int(ss) * 1000 + int((ms + "000")[:3])
 
 
 def format_time(ms: int, ms_digits: int = 3) -> str:
@@ -152,12 +165,8 @@ def format_time(ms: int, ms_digits: int = 3) -> str:
         ValueError: 当 ``ms_digits`` 不是 1..6 的整数时。
     """
     _validate_ms_digits(ms_digits)
-    ms = int(ms)
-    if ms < 0:
-        ms = 0
-    minute = ms // 60000
-    sec = (ms % 60000) // 1000
-    milli = ms % 1000
+    minute, rem = divmod(max(int(ms), 0), 60000)
+    sec, milli = divmod(rem, 1000)
     return f"{minute:02d}:{sec:02d}.{_format_fraction(milli, ms_digits)}"
 
 
@@ -178,13 +187,10 @@ def write_ass_timestamp(ms: Number) -> str:
     Returns:
         形如 ``"0:01:23.45"`` 的字符串。
     """
-    v = normalize_timestamp(ms)
-    total_ms = _round_half_up(v)
-    milli = total_ms % 1000
-    sec_total = total_ms // 1000
-    sec = sec_total % 60
-    min_total = sec_total // 60
-    return f"{min_total // 60}:{min_total % 60:02d}:{sec:02d}.{milli // 10:02d}"
+    total_sec, cs = divmod(_round_half_up(normalize_timestamp(ms)) // 10, 100)
+    hour, rem = divmod(total_sec, 3600)
+    min_, sec = divmod(rem, 60)
+    return f"{hour}:{min_:02d}:{sec:02d}.{cs:02d}"
 
 
 def is_word_sync_lyric(words: list[Word], start_time: int) -> bool:
@@ -202,25 +208,4 @@ def is_word_sync_lyric(words: list[Word], start_time: int) -> bool:
     Returns:
         是否为逐字歌词。
     """
-    if not words:
-        return False
-    if len(words) > 1:
-        return True
-    return words[0].start_time != start_time
-
-
-def normalize_line(line: Line) -> Line:
-    """就地将行的所有时间字段归一化。
-
-    纯文本行（``start_time is None``）原样保留，不会被错误地转成 0。
-    """
-    if line.start_time is not None:
-        line.start_time = normalize_timestamp(line.start_time)
-    if line.end_time is not None:
-        line.end_time = normalize_timestamp(line.end_time)
-    for w in line.words:
-        if w.start_time is not None:
-            w.start_time = normalize_timestamp(w.start_time)
-        if w.end_time is not None:
-            w.end_time = normalize_timestamp(w.end_time)
-    return line
+    return bool(words) and (len(words) > 1 or words[0].start_time != start_time)

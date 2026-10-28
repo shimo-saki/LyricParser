@@ -85,12 +85,12 @@ KeySchedule = list[Bits]
 
 def _bytes_to_bits(b: bytes) -> Bits:
     """将字节串转换为 bit 列表（每个 bit 用 0/1 表示，MSB 在前）。"""
-    return [int(c) for byte in b for c in f"{byte:08b}"]
+    return [(byte >> i) & 1 for byte in b for i in range(7, -1, -1)]
 
 
 def _bits_to_bytes(bits: Bits) -> bytes:
     """将 bit 列表转换为字节串（要求长度为 8 的倍数）。"""
-    return bytes(int("".join(map(str, bits[i:i + 8])), 2) for i in range(0, len(bits), 8))
+    return bytes(sum(bit << (7 - j) for j, bit in enumerate(bits[i : i + 8])) for i in range(0, len(bits), 8))
 
 
 def _permute(bits: Bits, table: list[int]) -> Bits:
@@ -160,9 +160,7 @@ def _des_block(block: bytes, keys: KeySchedule, decrypt: bool = False) -> bytes:
 
 
 # 预先计算三组密钥的子密钥调度
-_KEYS: list[KeySchedule] = [
-    _key_schedule(KEY_1), _key_schedule(KEY_2), _key_schedule(KEY_3),
-]
+_KEYS: list[KeySchedule] = [_key_schedule(KEY_1), _key_schedule(KEY_2), _key_schedule(KEY_3)]
 
 
 def _encrypt_block(block: bytes) -> bytes:

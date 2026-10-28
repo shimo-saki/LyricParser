@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "LyricParser"
-version = "0.1.0"
+version = "0.1.1"
 description = "用于解析和序列化 Lyric 格式的 Python 库"
 readme = "README.md"
 requires-python = ">=3.10"
